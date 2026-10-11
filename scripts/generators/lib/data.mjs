@@ -1,4 +1,4 @@
-import { digest } from './files.mjs';
+import { digest } from '../../utils/files.mjs';
 
 const DIALECTS = {
   en: 'General American English', es: 'neutral Latin American Spanish',

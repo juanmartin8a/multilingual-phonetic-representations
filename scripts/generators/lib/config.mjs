@@ -1,70 +1,27 @@
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import { parseArgs, parseEnv } from 'node:util';
+import { parseArgs } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { homedir } from 'node:os';
+import { integer, usd, rate } from '../../utils/numbers.mjs';
+import { tursoSettings } from '../../utils/turso.mjs';
 
-export const help = (task) => `Usage: bun [--env-file=.env.local] populate-${task}.mjs [options]
+export const help = (task) => `Usage: bun [--env-file=.env.local] scripts/generators/populate-${task}.mjs [options]
   (no flags)           Generate missing values and save finalized results locally
   --write             Insert each finalized batch; create no local files
   --budget USD        Per-run stop threshold; finish the active batch/reviews
   --config PATH       YAML settings; default <script-dir>/config/${task}.yml
   --model NAME        Default: gpt-6.1-sol
   --provider NAME     Only openai (provider-native AI Gateway)
-  --batch-size N      Words per AI call, 1-1000; default 20
-  --max-pages N       Stop after N database pages; 0 = all
+  --batch-size N      Usable words per processing batch / items per AI call, 1-1000; default 20
+  --batch-size-multiplicity N  Retrieve batch size × N usable words at a time; default 1, explicit integer N > 1
   --state-dir PATH    Local results/pair; default <script-dir>/.state
-  --project PATH      SAPO checkout; default ~/development/react-native/sapo
   --help              This help
-See README.md and config/${task}.yml. Environment variables supply credentials only.
-No deployment, production, or arbitrary URL flags.`;
-
-export function integer(value, name, min, max) {
-  const number = Number(value);
-  if (!Number.isSafeInteger(number) || number < min || number > max) {
-    throw new Error(`${name} must be an integer from ${min} to ${max}`);
-  }
-  return number;
-}
-
-// Integer nano-USD avoids accumulation and budget-comparison rounding errors.
-export function usd(value) {
-  if (!/^\d+(\.\d{1,9})?$/.test(String(value))) throw new Error('Invalid USD amount');
-  const [whole, fraction = ''] = String(value).split('.');
-  return integer(Number(whole) * 1e9 + Number(fraction.padEnd(9, '0')), 'USD', 0, 1e15);
-}
-
-function rate(value, name) {
-  if (!/^\d+(\.\d{1,3})?$/.test(String(value))) throw new Error(`${name}: use up to 3 decimal places`);
-  const [whole, fraction = ''] = String(value).split('.');
-  return integer(Number(whole) * 1000 + Number(fraction.padEnd(3, '0')), name, 0, 1e9);
-}
-
-export function developmentIdentity(project, key, read = readFileSync) {
-  // Never trust CONVEX_URL or CONVEX_DEPLOYMENT inherited from a production shell.
-  const local = parseEnv(read(resolve(project, '.env.local'), 'utf8'));
-  const match = /^dev:([a-z0-9-]+)(?:\s|$)/.exec(local.CONVEX_DEPLOYMENT ?? '');
-  if (!match) throw new Error('SAPO .env.local must name a hosted dev: deployment');
-  const name = match[1];
-  const url = `https://${name}.convex.cloud`;
-  if (local.EXPO_PUBLIC_CONVEX_URL !== url) throw new Error('Development URL/name mismatch');
-  if (typeof key !== 'string' || !key.trim()) {
-    throw new Error('CONVEX_KEY is missing; load credentials with bun --env-file=.env.local or use bun run transcriptions/respellings');
-  }
-  if (typeof key !== 'string' || !key.startsWith(`dev:${name}|`) || key.length <= `dev:${name}|`.length) {
-    throw new Error('CONVEX_KEY must be a dev deploy key for SAPO .env.local');
-  }
-  let production;
-  try { production = parseEnv(read(resolve(project, '.env.production.local'), 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (production && Object.values(production).some((value) => value === url || value === `dev:${name}`)) {
-    throw new Error('Development target also appears in production configuration');
-  }
-  return { name, url, key };
-}
+See README.md and scripts/generators/config/${task}.yml. Environment variables supply Turso connection settings and credentials.
+The database target comes from TURSO_DATABASE_URL.`;
 
 const CONFIG_SCHEMA = {
-  project: 'string', stateDir: 'string', batchSize: 'number', maxPages: 'number',
+  stateDir: 'string', batchSize: 'number', batchSizeMultiplicity: 'number',
   ai: {
     provider: 'string', model: 'string', api: 'string', reasoningEffort: 'string', maxOutputTokens: 'number',
     pricesUsdPerMillion: { input: 'string', cachedInput: 'string', cacheWrite: 'string', output: 'string' },
@@ -99,17 +56,13 @@ function validateSettings(value, schema, path = 'config') {
   }
 }
 
-function configPath(value, base) {
-  return resolve(base, value === '~' ? homedir() : value.startsWith('~/') ? `${homedir()}/${value.slice(2)}` : value);
-}
-
 export function configuration(task, argv = process.argv.slice(2), env = process.env, read = readFileSync) {
   if (!['transcriptions', 'respellings'].includes(task)) throw new Error('Unknown population task');
   const { values } = parseArgs({ args: argv, options: {
     help: { type: 'boolean' }, write: { type: 'boolean' },
     budget: { type: 'string' }, model: { type: 'string' }, provider: { type: 'string' },
-    'batch-size': { type: 'string' }, 'max-pages': { type: 'string' },
-    'state-dir': { type: 'string' }, project: { type: 'string' }, config: { type: 'string' },
+    'batch-size': { type: 'string' }, 'batch-size-multiplicity': { type: 'string' },
+    'state-dir': { type: 'string' }, config: { type: 'string' },
   } });
   if (values.help) return { help: true };
   const path = values.config ? resolve(values.config) : fileURLToPath(new URL(`../config/${task}.yml`, import.meta.url));
@@ -151,16 +104,20 @@ export function configuration(task, argv = process.argv.slice(2), env = process.
   }
   const budget = usd(values.budget ?? limits.maxUsd ?? '0');
   if (!budget) throw new Error('Generation requires a positive --budget or limits.maxUsd');
+  const batchSize = integer(values['batch-size'] ?? settings.batchSize ?? 20, 'batch size', 1, 1000);
+  const multiplicity = values['batch-size-multiplicity'] ?? settings.batchSizeMultiplicity;
+  const batchSizeMultiplicity = multiplicity === undefined ? 1 :
+    integer(multiplicity, 'batch size multiplicity', 2, Math.floor(Number.MAX_SAFE_INTEGER / batchSize));
+  const database = tursoSettings(env);
   return {
-    project: values.project ? resolve(values.project) : configPath(settings.project ?? '~/development/react-native/sapo', dirname(path)),
-    stateDir: values['state-dir'] ? resolve(values['state-dir']) : settings.stateDir ? configPath(settings.stateDir, dirname(path)) :
+    databaseUrl: database.url, databaseToken: database.authToken,
+    stateDir: values['state-dir'] ? resolve(values['state-dir']) : settings.stateDir ? resolve(dirname(path), settings.stateDir === '~' ? homedir() :
+      settings.stateDir.startsWith('~/') ? resolve(homedir(), settings.stateDir.slice(2)) : settings.stateDir) :
       fileURLToPath(new URL('../.state', import.meta.url)),
     write: values.write ?? false,
     budget, model, provider, api, effort, prices, account, gateway,
     token: env.CLOUDFLARE_API_TOKEN,
-    devKey: env.CONVEX_KEY,
-    batchSize: integer(values['batch-size'] ?? settings.batchSize ?? 20, 'batch size', 1, 1000),
-    maxPages: integer(values['max-pages'] ?? settings.maxPages ?? 0, 'max pages', 0, 1e9),
+    batchSize, batchSizeMultiplicity,
     outputTokens: integer(ai.maxOutputTokens ?? 25000, 'output tokens', 256, 128000),
     rpm: integer(limits.requestsPerMinute ?? 10, 'RPM', 1, 1000),
     tpm: integer(limits.tokensPerMinute ?? 200000, 'TPM', 1000, 1e9),

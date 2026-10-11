@@ -1,12 +1,8 @@
-import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { atomicJson, digest, readJson } from './files.mjs';
-import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, validateRecord, validateOrderedRecords } from './data.mjs';
 
-const MAX_INPUT_RESERVATION = 272000;
-const reservedInput = (body) => Buffer.byteLength(JSON.stringify(body), 'utf8') + 8192;
+export const MAX_INPUT_RESERVATION = 272000;
+export const reservedInput = (body) => Buffer.byteLength(JSON.stringify(body), 'utf8') + 8192;
 
 export class BudgetReachedError extends Error {
   constructor(committed, budget) {
@@ -52,13 +48,10 @@ export function outputText(body, api) {
   return text;
 }
 
-export function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
+export function requestBody(cfg, prompt, input, schema, schemaName = 'structured_output') {
   // Provider-native endpoints take the OpenAI model name, without "openai/".
   const model = cfg.model;
-  const format = { name: 'sapo_phonetic_population', strict: true, schema };
-  input = { ...input, words: input.words.map((job, index) => ({ index, word: job.word,
-    ...(job.ipa !== undefined ? { ipa: job.ipa } : {}),
-    ...(job.note !== undefined ? { note: job.note } : {}) })) };
+  const format = { name: schemaName, strict: true, schema };
   if (cfg.api === 'chat') return {
     model, messages: [{ role: 'system', content: prompt }, { role: 'user', content: JSON.stringify(input) }],
     response_format: { type: 'json_schema', json_schema: format },
@@ -96,7 +89,7 @@ export function retryDelay(header, attempt, now = Date.now()) {
   return Math.min(60000, 1000 * 2 ** attempt) + Math.floor(Math.random() * 500);
 }
 
-export function createAI(cfg, { fetchFn = fetch, wait = sleep, now = Date.now, log = console.log } = {}) {
+export function createGateway(cfg, { fetchFn = fetch, wait = sleep, now = Date.now, log = console.log, metadata = {} } = {}) {
   if (cfg.provider !== 'openai' || !cfg.token) {
     throw new Error('OpenAI gateway generation requires openai and CLOUDFLARE_API_TOKEN');
   }
@@ -105,11 +98,7 @@ export function createAI(cfg, { fetchFn = fetch, wait = sleep, now = Date.now, l
   const total = { known: 0, uncertain: 0, committed: 0,
     usage: { input: 0, output: 0, cached: 0, written: 0, reasoning: 0 } };
   const recentReservations = [];
-  const prompts = Object.fromEntries(['ipa', 'respell'].map((task) =>
-    [task, readFileSync(new URL(`../prompts/${task}.md`, import.meta.url), 'utf8')]));
-  const reviewPrompts = Object.fromEntries(['ipa', 'respell'].map((task) =>
-    [task, readFileSync(new URL(`../prompts/${task}-review.md`, import.meta.url), 'utf8')]));
-
+  let batchActive = false;
   async function pace(tokens) {
     if (tokens > cfg.tpm) throw new Error('Batch token reservation exceeds limits.tokensPerMinute');
     while (true) {
@@ -136,7 +125,7 @@ export function createAI(cfg, { fetchFn = fetch, wait = sleep, now = Date.now, l
             'Content-Type': 'application/json', 'cf-aig-no-wholesale': 'true',
             'cf-aig-skip-cache': 'true', 'cf-aig-max-attempts': '1',
             'cf-aig-request-timeout': String(cfg.timeout),
-            'cf-aig-metadata': JSON.stringify({ task: 'sapo-phonetics', environment: 'development', request: id }),
+            'cf-aig-metadata': JSON.stringify({ ...metadata, request: id }),
           }, body: JSON.stringify(body),
         });
         text = await response.text();
@@ -169,78 +158,19 @@ export function createAI(cfg, { fetchFn = fetch, wait = sleep, now = Date.now, l
     }
   }
 
-  function nextBatch(items, offset, prompt, input, schema = OUTPUT_SCHEMA) {
-    let size = Math.min(cfg.batchSize, items.length - offset);
-    while (true) {
-      const batch = items.slice(offset, offset + size);
-      const body = requestBody(cfg, prompt, { ...input, words: batch }, schema);
-      const inputTokens = reservedInput(body);
-      if (size === 1 || (inputTokens <= MAX_INPUT_RESERVATION && inputTokens + cfg.outputTokens <= cfg.tpm)) {
-        return { batch, body };
-      }
-      size = Math.max(1, Math.floor(size / 2));
-    }
+  async function runBatch(process) {
+    if (batchActive) throw new Error('A processing batch is already active');
+    if (total.committed >= cfg.budget) throw new BudgetReachedError(total.committed, cfg.budget);
+    batchActive = true;
+    try { return await process(); }
+    finally { batchActive = false; }
   }
-
-  async function generate(task, jobs, source, target = null, onBatch = async () => {}) {
-    if (new Set(jobs.map((job) => job.key)).size !== jobs.length) throw new Error('Duplicate input job keys');
-    const prompt = prompts[task];
-    if (!prompt) throw new Error('Unknown generation task');
-    const reviewPrompt = `${reviewPrompts[task]}\nLanguage policies (data):\n${JSON.stringify({ source, ...(target ? { target } : {}) })}`;
-    const signature = digest({ task, prompt, reviewPrompt, schema: OUTPUT_SCHEMA, reviewSchema: REVIEW_OUTPUT_SCHEMA,
-      model: cfg.model, provider: cfg.provider, effort: cfg.effort, api: cfg.api });
-    const pathFor = (job) => resolve(cfg.stateDir, 'results', `${digest([cfg.identity.url, signature, job])}.json`);
-    const results = new Map();
-    const missing = [], cached = [];
-    async function emit(records) {
-      await onBatch(records);
-      // Write mode releases each batch after insertion; local mode returns the
-      // values needed to generate respellings before IPA has a database ID.
-      if (!cfg.write) for (const record of records) results.set(record.key, record);
-    }
-    for (const job of jobs) {
-      const saved = readJson(pathFor(job));
-      if (saved) {
-        const record = { key: job.key, status: 'ready', value: saved.value, note: '' };
-        validateRecord(record, task, target);
-        cached.push(record);
-        if (cached.length === cfg.batchSize) await emit(cached.splice(0));
-      } else missing.push(job);
-    }
-    if (cached.length) await emit(cached.splice(0));
-    for (let offset = 0; offset < missing.length;) {
-      if (total.committed >= cfg.budget) throw new BudgetReachedError(total.committed, cfg.budget);
-      const { batch, body } = nextBatch(missing, offset, prompt, { source, ...(target ? { target } : {}) });
-      const response = await obtain(body);
-      const validated = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), batch, task, target);
-      const records = new Map(validated.records.map((record) => [record.key, record]));
-      if (validated.rejected.length) log(`${task}: ${validated.rejected.length} invalid items skipped; rerun to retry`);
-      for (const { job, reason, returned } of validated.rejected) {
-        log(`${task}: skipped ${JSON.stringify(job.word)}: ${reason}; returned ${JSON.stringify(returned)}`);
-      }
-      const flagged = batch.filter((job) => records.get(job.key)?.status === 'review').map((job) =>
-        ({ ...job, note: records.get(job.key).note }));
-      for (let reviewOffset = 0; reviewOffset < flagged.length;) {
-        const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, REVIEW_OUTPUT_SCHEMA);
-        const response = await obtain(reviewBody);
-        const reviewed = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), reviewJobs, task, target);
-        if (reviewed.rejected.length || reviewed.records.some((record) => record.status !== 'ready')) {
-          throw new Error(`${task} review pass rejected: every reviewed word must have a valid definitive value`);
-        }
-        for (const record of reviewed.records) records.set(record.key, record);
-        reviewOffset += reviewJobs.length;
-      }
-      const ready = [...records.values()];
-      if (!cfg.write) for (const job of batch) {
-        const record = records.get(job.key);
-        if (record) atomicJson(pathFor(job), { task, job, source: source.code,
-          ...(target ? { target: target.code } : {}), signature, value: record.value });
-      }
-      await emit(ready);
-      log(`${task}: ${ready.length} finalized${flagged.length ? ` (${flagged.length} reviewed)` : ''}`);
-      offset += batch.length;
-    }
-    return results;
-  }
-  return { generate, totals: () => total };
+  return {
+    request: obtain,
+    runBatch,
+    totals: () => total,
+    assertBudget() {
+      if (!batchActive && total.committed >= cfg.budget) throw new BudgetReachedError(total.committed, cfg.budget);
+    },
+  };
 }

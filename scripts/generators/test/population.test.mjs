@@ -1,19 +1,20 @@
 import { test, afterEach } from 'bun:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { configuration, developmentIdentity, usd } from '../lib/config.mjs';
-import { readJson } from '../lib/files.mjs';
+import { configuration } from '../lib/config.mjs';
+import { usd } from '../../utils/numbers.mjs';
+import { readJson } from '../../utils/files.mjs';
 import { validIpa, validRespelling, validateRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA } from '../lib/data.mjs';
-import { BudgetReachedError, createAI, usageCost, requestBody, reservation, outputText, retryDelay } from '../lib/ai.mjs';
+import { createAI, requestBody } from '../lib/ai.mjs';
+import { BudgetReachedError, usageCost, reservation, outputText, retryDelay } from '../../utils/ai-gateway.mjs';
 import { populate } from '../lib/run.mjs';
-import { connect } from '../lib/db.mjs';
 
-const identity = { url: 'https://test-dev.convex.cloud' };
+const databaseSettings = { TURSO_DATABASE_URL: 'libsql://test.turso.io', TURSO_AUTH_TOKEN: 'fake-database-token' };
 const languages = [
-  { _id: 'en-id', language_code: 'en', name: 'English', hasEntries: true },
-  { _id: 'es-id', language_code: 'es', name: 'Spanish', hasEntries: true },
+  { id: 'en-id', language_code: 'en', name: 'English', hasEntries: true },
+  { id: 'es-id', language_code: 'es', name: 'Spanish', hasEntries: true },
 ];
 const source = languagePolicy(languages[0]);
 const target = languagePolicy(languages[1]);
@@ -28,13 +29,13 @@ function fixture(extra = {}) {
   temporaryDirectories.push(stateDir);
   const cfg = { ...configured(['--budget', '10'], {
     CLOUDFLARE_API_TOKEN: 'fake-gateway-token',
-  }, { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } }), stateDir, identity, ...extra };
+  }, { cloudflare: { accountId: 'a'.repeat(32), gatewayId: 'test' } }), stateDir, ...extra };
   return cfg;
 }
 
 const gatewaySettings = { accountId: 'a'.repeat(32), gatewayId: 'test' };
 function configured(argv = [], env = {}, settings = {}) {
-  return configuration('transcriptions', argv, { CLOUDFLARE_API_TOKEN: 'fake-gateway-token', ...env },
+  return configuration('transcriptions', argv, { ...databaseSettings, CLOUDFLARE_API_TOKEN: 'fake-gateway-token', ...env },
     () => typeof settings === 'string' ? settings : JSON.stringify({ ...settings,
       cloudflare: { ...gatewaySettings, ...settings.cloudflare }, limits: { maxUsd: '10', ...settings.limits } }));
 }
@@ -47,6 +48,7 @@ function assertNoCredentials(cfg, directory = cfg.stateDir) {
       const text = readFileSync(path, 'utf8');
       assert.equal(text.includes('fake-openai-key'), false, `OpenAI key leaked to ${file.name}`);
       assert.equal(text.includes(cfg.token), false, `Gateway token leaked to ${file.name}`);
+      assert.equal(text.includes(cfg.databaseToken), false, `Database token leaked to ${file.name}`);
     }
   }
 }
@@ -88,8 +90,9 @@ function fakeDatabase(entries, pageSize = 50) {
   let next = 1;
   const db = {
     calls, entries,
-    languages: async () => structuredClone(languages),
-    page: async ({ languageCode, cursor, targetLanguageCode, numItems }) => {
+    languages: async () => languages.map((language) => ({ ...language,
+      hasEntries: entries.some((entry) => entry.language_code === language.language_code) })),
+    page: async ({ languageCode, cursor, targetLanguageCode, numItems, includeCompleted }) => {
       calls.pages++;
       const all = entries.filter((e) => e.language_code === languageCode);
       const offset = Number(cursor ?? 0);
@@ -97,19 +100,21 @@ function fakeDatabase(entries, pageSize = 50) {
         transcriptions: entry.transcriptions.map((ipa) => ({ ...ipa,
           hasRespelling: (ipa.targets ?? []).includes(targetLanguageCode) })),
       }));
-      return { page, continueCursor: String(offset + page.length), isDone: offset + page.length >= all.length };
+      const usable = includeCompleted ? page : page.filter((entry) => entry.transcriptions.length === 0 ||
+        (targetLanguageCode && entry.transcriptions.some((t) => !t.hasRespelling)));
+      return { page: usable, continueCursor: String(offset + page.length), isDone: offset + page.length >= all.length };
     },
     insertTranscriptions: async (rows) => {
       calls.ipa++;
       for (const row of rows) {
-        const entry = entries.find((e) => e._id === row.entry_id);
-        if (!entry.transcriptions.length) entry.transcriptions.push({ _id: `ipa-${next++}`, transcription: row.transcription, targets: [] });
+        const entry = entries.find((e) => e.id === row.entry_id);
+        if (!entry.transcriptions.length) entry.transcriptions.push({ id: `ipa-${next++}`, transcription: row.transcription, targets: [] });
       }
     },
     insertRespellings: async (rows) => {
       calls.respell++;
       for (const row of rows) {
-        const ipa = entries.flatMap((e) => e.transcriptions).find((t) => t._id === row.phonetic_transcription_id);
+        const ipa = entries.flatMap((e) => e.transcriptions).find((t) => t.id === row.phonetic_transcription_id);
         assert.ok(ipa, 'Respelling must reference a real IPA database ID');
         if (!ipa.targets.includes('es')) ipa.targets.push('es');
       }
@@ -118,7 +123,7 @@ function fakeDatabase(entries, pageSize = 50) {
   return db;
 }
 
-const entry = (id, code = 'en', transcriptions = []) => ({ _id: id, language_id: `${code}-id`,
+const entry = (id, code = 'en', transcriptions = []) => ({ id, language_id: `${code}-id`,
   language_code: code, orthographic_form: `word-${id}`, transcriptions });
 
 test('configuration generates by default and custom models require explicit prices', () => {
@@ -126,7 +131,7 @@ test('configuration generates by default and custom models require explicit pric
   assert.equal(Object.hasOwn(cfg, 'generate'), false);
   assert.equal(cfg.write, false);
   assert.equal(cfg.budget, 10e9);
-  assert.equal(cfg.maxPages, 0);
+  assert.equal(cfg.batchSizeMultiplicity, 1);
   assert.equal(configured(['--write']).write, true);
   assert.throws(() => configured(['--generate']), /Unknown option/);
   assert.throws(() => configured(['--rescan']), /Unknown option/);
@@ -144,7 +149,7 @@ test('configuration generates by default and custom models require explicit pric
 
 test('both scripts allow CLI and YAML batch sizes through 1000 and reject larger values', () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const config = (args, settings = {}) => configuration(task, args, { CLOUDFLARE_API_TOKEN: 'fake' },
+    const config = (args, settings = {}) => configuration(task, args, { ...databaseSettings, CLOUDFLARE_API_TOKEN: 'fake' },
       () => JSON.stringify({ ...settings, cloudflare: gatewaySettings, limits: { maxUsd: '1' } }));
     for (const batchSize of [1, 50, 51, 1000]) {
       assert.equal(config(['--batch-size', String(batchSize)]).batchSize, batchSize);
@@ -157,16 +162,42 @@ test('both scripts allow CLI and YAML batch sizes through 1000 and reject larger
   }
 });
 
+test('batch size multiplicity defaults to 1 and accepts only explicit safe integers greater than 1', () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const config = (args, settings = {}) => configuration(task, args, { ...databaseSettings, CLOUDFLARE_API_TOKEN: 'fake' },
+      () => JSON.stringify({ ...settings, cloudflare: gatewaySettings, limits: { maxUsd: '1' } }));
+    assert.equal(config([]).batchSizeMultiplicity, 1);
+    assert.equal(config([], { batchSizeMultiplicity: 3 }).batchSizeMultiplicity, 3);
+    assert.equal(config(['--batch-size-multiplicity', '2'], { batchSizeMultiplicity: 3 }).batchSizeMultiplicity, 2);
+    for (const value of ['', ' ', '0', '1', '-1', '1.5', '2.5', 'NaN', 'Infinity', 'no', '9007199254740992']) {
+      assert.throws(() => config([`--batch-size-multiplicity=${value}`]), /batch size multiplicity/);
+    }
+    for (const value of [0, 1, -1, 1.5, 2.5, true, null, '2', [], {}, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => config([], { batchSizeMultiplicity: value }));
+    }
+    for (const batchSize of [1, 3, 20, 1000]) {
+      const largest = Math.floor(Number.MAX_SAFE_INTEGER / batchSize);
+      assert.equal(config([], { batchSize, batchSizeMultiplicity: largest }).batchSizeMultiplicity, largest);
+      assert.throws(() => config([], { batchSize, batchSizeMultiplicity: largest + 1 }));
+      assert.throws(() => config(['--batch-size-multiplicity', String(largest + 1)], { batchSize }));
+    }
+    assert.throws(() => config(['--max-rows', '20']), /Unknown option/);
+    assert.throws(() => config([], { maxRows: 20 }), /Unknown setting/);
+    assert.throws(() => config(['--max-pages', '1']), /Unknown option/);
+    assert.throws(() => config([], { maxPages: 1 }), /Unknown setting/);
+  }
+});
+
 test('YAML settings, CLI overrides, and credential-only environment variables', () => {
-  const cfg = configured(['--budget', '0.123456789', '--batch-size', '5', '--max-pages', '2'], {
-    CONVEX_KEY: 'dev:test-dev|fake', CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key',
+  const cfg = configured(['--budget', '0.123456789', '--batch-size', '5', '--batch-size-multiplicity', '2'], {
+    ...databaseSettings, CLOUDFLARE_API_TOKEN: 'fake', OPENAI_API_KEY: 'fake-openai-key',
     AI_PROVIDER: 'ignored', AI_MODEL: 'ignored', AI_API: 'ignored', AI_REASONING_EFFORT: 'none',
     AI_INPUT_USD_PER_M: '999', SAPO_MAX_USD: '999', AI_MAX_OUTPUT_TOKENS: '1',
     AI_REQUESTS_PER_MINUTE: '999', AI_TOKENS_PER_MINUTE: '1', AI_MAX_ATTEMPTS: '999', AI_TIMEOUT_MS: '1',
     CLOUDFLARE_ACCOUNT_ID: 'ignored', CLOUDFLARE_AI_GATEWAY_ID: 'ignored', SAPO_LANGUAGE_POLICY_FILE: '/ignored',
   }, `
 batchSize: 10
-maxPages: 3
+batchSizeMultiplicity: 3
 ai:
   provider: openai
   model: gpt-6.1-sol
@@ -194,7 +225,7 @@ languagePolicies:
 `);
   assert.equal(cfg.budget, 123456789);
   assert.equal(cfg.batchSize, 5);
-  assert.equal(cfg.maxPages, 2);
+  assert.equal(cfg.batchSizeMultiplicity, 2);
   assert.equal(cfg.model, 'gpt-6.1-sol');
   assert.equal(cfg.provider, 'openai');
   assert.equal(cfg.api, 'responses');
@@ -209,7 +240,8 @@ languagePolicies:
   assert.equal(cfg.gateway, 'test');
   assert.equal(cfg.token, 'fake');
   assert.equal(cfg.openaiKey, undefined);
-  assert.equal(cfg.devKey, 'dev:test-dev|fake');
+  assert.equal(cfg.databaseUrl, 'https://test.turso.io');
+  assert.equal(cfg.databaseToken, 'fake-database-token');
   assert.equal(Object.hasOwn(cfg, 'generate'), false);
   assert.equal(cfg.write, false);
   assert.equal(languagePolicy(languages[1], cfg.languagePolicies).dialect, 'Castilian Spanish');
@@ -217,7 +249,7 @@ languagePolicies:
 
 test('YAML rejects unknown settings, invalid types, invalid policies, and unsafe limits', () => {
   for (const settings of [
-    { generate: true }, { write: true }, { token: 'secret' }, { cloudflare: { apiToken: 'secret' } },
+    { generate: true }, { write: true }, { project: '/checkout' }, { token: 'secret' }, { cloudflare: { apiToken: 'secret' } },
     { ai: { apiKey: 'secret' } }, { openaiKey: 'secret' },
     { ai: { modle: 'typo' } }, { limits: { maxUsd: 1 } }, { ai: { pricesUsdPerMillion: { input: 2 } } },
     { batchSize: true }, { batchSize: null }, { batchSize: 1.5 }, { batchSize: 0 },
@@ -231,7 +263,7 @@ test('YAML rejects unknown settings, invalid types, invalid policies, and unsafe
   ]) assert.throws(() => configured([], {}, settings), JSON.stringify(settings));
   for (const text of ['', 'null', '[]', 'ai: [']) assert.throws(() => configured([], {}, text));
   assert.throws(() => configured([], {}, 'batchSize: .nan'));
-  assert.throws(() => configured(['--budget', '1'], { CLOUDFLARE_API_TOKEN: undefined }), /Cloudflare/);
+  assert.throws(() => configured(['--budget', '1'], { ...databaseSettings, CLOUDFLARE_API_TOKEN: undefined }), /Cloudflare/);
   assert.throws(() => configured([], {}, { limits: { maxUsd: '0' } }), /positive/);
 });
 
@@ -250,7 +282,7 @@ test('alternate YAML models require complete prices and cannot reuse another mod
 
 test('Bun only loads explicitly selected environment files, even with NODE_ENV=production', () => {
   const cfg = fixture();
-  writeFileSync(join(cfg.stateDir, 'bunfig.toml'), readFileSync(new URL('../bunfig.toml', import.meta.url)));
+  writeFileSync(join(cfg.stateDir, 'bunfig.toml'), readFileSync(new URL('../../../bunfig.toml', import.meta.url)));
   writeFileSync(join(cfg.stateDir, '.env'), 'SAPO_BUN_ENV_TEST=explicit\n');
   writeFileSync(join(cfg.stateDir, '.env.production'), 'SAPO_BUN_ENV_TEST=production\n');
   writeFileSync(join(cfg.stateDir, '.env.local'), 'SAPO_BUN_ENV_TEST=local\n');
@@ -264,28 +296,6 @@ test('Bun only loads explicitly selected environment files, even with NODE_ENV=p
   };
   assert.equal(run([]), 'unset');
   assert.equal(run(['--env-file=.env']), 'explicit');
-});
-
-test('the existing Convex client resolves under Bun and uses the guarded development URL', async () => {
-  const cfg = fixture({ identity: { ...identity, key: 'dev:test-dev|fake' } });
-  const originalFetch = globalThis.fetch;
-  let calls = 0;
-  globalThis.fetch = async (url, options) => {
-    calls++;
-    assert.equal(url, `${identity.url}/api/query`);
-    assert.equal(options.redirect, 'error');
-    assert.equal(options.headers.Authorization, 'Convex dev:test-dev|fake');
-    const body = JSON.parse(options.body);
-    assert.equal(body.path, 'phoneticPopulation:languages');
-    assert.equal(body.args[0].expectedUrl, identity.url);
-    return new Response(JSON.stringify({ status: 'success', value: languages, logLines: [] }));
-  };
-  try {
-    assert.deepEqual(await connect(cfg).languages(), languages);
-    assert.equal(calls, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
 });
 
 test('exact integer costs include cache writes and do not double count reasoning', () => {
@@ -471,7 +481,7 @@ test('missing usage stops before result caching', async () => {
 
 test('IPA population covers all languages and preserves existing variants', async () => {
   const cfg = fixture({ write: true });
-  const db = fakeDatabase([entry('1'), entry('2', 'en', [{ _id: 'old', transcription: '/old/', targets: [] }]), entry('3', 'es')]);
+  const db = fakeDatabase([entry('1'), entry('2', 'en', [{ id: 'old', transcription: '/old/', targets: [] }]), entry('3', 'es')]);
   const count = { calls: 0 };
   const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
   await populate('transcriptions', cfg, db, ai, { log: () => {} });
@@ -485,7 +495,7 @@ test('IPA population covers all languages and preserves existing variants', asyn
 
 test('both scripts finalize reviews before writing and skip inserted results on restart', async () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const cfg = fixture({ write: true, batchSize: 1, rpm: 1000, tpm: 1e9 });
+    const cfg = fixture({ write: true, batchSize: 1, batchSizeMultiplicity: 2, rpm: 1000, tpm: 1e9 });
     const db = fakeDatabase([entry('1'), entry('2')]);
     const count = { calls: 0 };
     const ai = createAI(cfg, { fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) => count.calls % 2 ?
@@ -566,9 +576,9 @@ test('review output must be definitive, correctly aligned and valid before any d
   }
 });
 
-test('1000-word batches span Convex pages for both scripts while mutation sizes remain bounded', async () => {
+test('1000-word batches span database pages for both scripts while mutation sizes remain bounded', async () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const cfg = fixture({ write: true, batchSize: 1000, budget: 100e9, rpm: 1000, tpm: 1e9 });
+    const cfg = fixture({ write: true, batchSize: 1000, batchSizeMultiplicity: 2, budget: 100e9, rpm: 1000, tpm: 1e9 });
     const db = fakeDatabase(Array.from({ length: 1001 }, (_, i) => entry(String(i))));
     const page = db.page;
     const mutations = [db.insertTranscriptions, db.insertRespellings];
@@ -617,21 +627,6 @@ test('long review notes are split to fit TPM reservations and every flagged item
 });
 
 
-test('development identity rejects production, project, preview, and mismatched keys', () => {
-  const read = (path) => path.endsWith('.env.local') ?
-    'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud\n' :
-    'EXPO_PUBLIC_CONVEX_URL=https://production.convex.cloud\n';
-  for (const key of [undefined, '', ' ', 'prod:test-dev|secret', 'project:foo|secret',
-    'preview:foo|secret', 'secret', 'dev:wrong|secret', 'dev:test-dev|']) {
-    assert.throws(() => developmentIdentity('/project', key, read));
-  }
-  assert.equal(developmentIdentity('/project', 'dev:test-dev|secret', read).url, identity.url);
-  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
-    'CONVEX_DEPLOYMENT=prod:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
-  assert.throws(() => developmentIdentity('/project', 'dev:test-dev|secret', () =>
-    'CONVEX_DEPLOYMENT=dev:test-dev\nEXPO_PUBLIC_CONVEX_URL=https://test-dev.convex.cloud'));
-});
-
 test('generation always requires gateway credentials and a positive per-run budget', () => {
   const read = () => JSON.stringify({ cloudflare: gatewaySettings, limits: { maxUsd: '1' } });
   assert.throws(() => configuration('transcriptions', [], {}, read), /Cloudflare/);
@@ -640,18 +635,17 @@ test('generation always requires gateway credentials and a positive per-run budg
   assert.throws(() => createAI(fixture({ token: undefined })), /CLOUDFLARE_API_TOKEN/);
   const cfg = configured([], { OPENAI_API_KEY: 'unused' });
   assert.equal(cfg.openaiKey, undefined);
-  assert.equal(cfg.maxPages, 0);
+  assert.equal(cfg.batchSizeMultiplicity, 1);
 });
 
 test('config paths are selected per script and resolve relative YAML paths', () => {
   const cfg = fixture();
   const path = join(cfg.stateDir, 'config.yml');
-  writeFileSync(path, JSON.stringify({ project: './checkout', stateDir: './results',
+  writeFileSync(path, JSON.stringify({ stateDir: './results',
     cloudflare: gatewaySettings, limits: { maxUsd: '0.25' } }));
-  const env = { CLOUDFLARE_API_TOKEN: 'fake' };
+  const env = { ...databaseSettings, CLOUDFLARE_API_TOKEN: 'fake' };
   for (const task of ['transcriptions', 'respellings']) {
     const selected = configuration(task, ['--config', path], env);
-    assert.equal(selected.project, join(cfg.stateDir, 'checkout'));
     assert.equal(selected.stateDir, join(cfg.stateDir, 'results'));
     assert.equal(selected.budget, 250000000);
     const overridden = configuration(task, ['--config', path, '--state-dir', cfg.stateDir], env);
@@ -660,7 +654,7 @@ test('config paths are selected per script and resolve relative YAML paths', () 
       assert.equal(file, new URL(`../config/${task}.yml`, import.meta.url).pathname);
       return JSON.stringify({ cloudflare: gatewaySettings, limits: { maxUsd: '1' } });
     });
-    assert.equal(defaults.project, join(homedir(), 'development/react-native/sapo'));
+    assert.equal(defaults.stateDir, new URL('../.state', import.meta.url).pathname);
   }
   assert.deepEqual(configuration('transcriptions', ['--help', '--config', '/missing'], {}), { help: true });
   assert.throws(() => configuration('unknown', [], env), /Unknown population task/);
@@ -723,8 +717,8 @@ test('write mode creates no state directory for either script', async () => {
 test('write mode reads existing local results and pair without modifying any files', async () => {
   const cfg = fixture();
   const db = fakeDatabase([entry('1'), entry('2', 'en', [
-    { _id: 'old-1', transcription: '/a/', targets: ['es'] },
-    { _id: 'old-2', transcription: '/b/', targets: [] },
+    { id: 'old-1', transcription: '/a/', targets: ['es'] },
+    { id: 'old-2', transcription: '/b/', targets: [] },
   ])]);
   const count = { calls: 0 };
   const options = { select: () => 0, log: () => {} };
@@ -741,9 +735,9 @@ test('write mode reads existing local results and pair without modifying any fil
 
 test('each AI batch is reviewed and inserted before the next generation batch for both scripts', async () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const cfg = fixture({ write: true, batchSize: 1 });
+    const cfg = fixture({ write: true, batchSize: 1, batchSizeMultiplicity: 2 });
     const db = fakeDatabase([entry('1'), entry('2')].map((e, i) => task === 'respellings' ?
-      { ...e, transcriptions: [{ _id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
+      { ...e, transcriptions: [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
     const events = [];
     const field = task === 'transcriptions' ? 'insertTranscriptions' : 'insertRespellings';
     const insert = db[field];
@@ -763,7 +757,7 @@ test('each AI batch is reviewed and inserted before the next generation batch fo
 });
 
 test('earlier write batches survive an insertion failure and restart generates only missing data', async () => {
-  const cfg = fixture({ write: true, batchSize: 1 });
+  const cfg = fixture({ write: true, batchSize: 1, batchSizeMultiplicity: 3 });
   const db = fakeDatabase([entry('1'), entry('2'), entry('3')]);
   const insert = db.insertTranscriptions;
   db.insertTranscriptions = async (rows) => {
@@ -785,9 +779,9 @@ test('earlier write batches survive an insertion failure and restart generates o
 test('each restart gets a fresh budget and discovers progress from the database or local cache', async () => {
   for (const write of [false, true]) {
     for (const task of ['transcriptions', 'respellings']) {
-      const cfg = fixture({ write, batchSize: 1, budget: 1 });
+      const cfg = fixture({ write, batchSize: 1, batchSizeMultiplicity: 2, budget: 1 });
       const db = fakeDatabase([entry('1'), entry('2')].map((e, i) => task === 'respellings' ?
-        { ...e, transcriptions: [{ _id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
+        { ...e, transcriptions: [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
       const count = { calls: 0 };
       for (let run = 1; run <= 2; run++) {
         const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
@@ -830,7 +824,7 @@ test('rate limiting is rolling within one run and resets on restart', async () =
   assert.deepEqual(readdirSync(cfg.stateDir), []);
 });
 
-test('cache signatures distinguish deployment, model settings, policies, and exact IPA variants', async () => {
+test('cache signatures distinguish database, model settings, policies, and exact IPA variants', async () => {
   const cfg = fixture();
   const count = { calls: 0 };
   const jobs = [{ key: '1', word: 'hello' }];
@@ -838,7 +832,7 @@ test('cache signatures distinguish deployment, model settings, policies, and exa
   await createAI(cfg, options).generate('ipa', jobs, source);
   await createAI(cfg, options).generate('ipa', jobs, source);
   assert.equal(count.calls, 1);
-  await createAI({ ...cfg, identity: { url: 'https://other-dev.convex.cloud' } }, options).generate('ipa', jobs, source);
+  await createAI({ ...cfg, databaseUrl: 'https://other.turso.io' }, options).generate('ipa', jobs, source);
   await createAI(cfg, options).generate('ipa', jobs, { ...source, dialect: 'British English' });
   const fetcher = fakeFetch(count);
   await createAI({ ...cfg, effort: 'medium' }, { log: () => {}, fetchFn: (url, options) => {
@@ -885,26 +879,203 @@ test('failed review saves no intermediate result and the next run starts generat
   }
 });
 
-test('a page limit stops scanning without saving progress and the next invocation scans from the start', async () => {
-  const cfg = fixture({ write: true, batchSize: 1000, maxPages: 2 });
+test('the default multiplicity retrieves one batch at a time and keeps processing', async () => {
+  const cfg = fixture({ write: true, batchSize: 100 });
   const db = fakeDatabase(Array.from({ length: 125 }, (_, i) => entry(String(i))));
   const count = { calls: 0 };
   await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
-  assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 100);
-  assert.equal(count.calls, 1);
-  assert.deepEqual(readdirSync(cfg.stateDir), []);
-  const full = { ...cfg, maxPages: 0 };
-  await populate('transcriptions', full, db, createAI(full, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
   assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
   assert.equal(count.calls, 2);
+  assert.deepEqual(readdirSync(cfg.stateDir), []);
+  await populate('transcriptions', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
+  assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+  assert.equal(count.calls, 2);
+});
+
+test('both scripts keep retrieving single batches by default in local and write modes', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    for (const write of [false, true]) {
+      const cfg = fixture({ write, batchSize: 2, rpm: 1000, tpm: 1e9 });
+      const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
+      const requests = [];
+      const page = db.page;
+      db.page = async (args) => { requests.push(args); return page(args); };
+      const logs = [];
+      const count = { calls: 0 };
+      await populate(task, cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
+        { log: (message) => logs.push(message), select: () => 0 });
+      assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
+      assert.deepEqual(requests.filter((args) => !args.includeCompleted).map((args) => args.numItems), [2, 2, 2]);
+      assert.match(logs.at(-1), /Scan complete/);
+      if (write) {
+        assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+        if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+        assert.deepEqual(readdirSync(cfg.stateDir), []);
+      } else {
+        assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 5 : 10);
+        assert.ok(db.entries.every((e) => e.transcriptions.length === 0));
+      }
+    }
+  }
+});
+
+test('changing retrieval multiplicity reuses cached results in local and write modes for both scripts', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ batchSize: 2, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
+    const count = { calls: 0 };
+    const run = async (settings) => populate(task, settings, db,
+      createAI(settings, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {}, select: () => 0 });
+    await run(cfg);
+    const multiplied = { ...cfg, batchSizeMultiplicity: 2 };
+    await run(multiplied);
+    assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
+    assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 5 : 10);
+    const before = snapshot(cfg.stateDir);
+    await run({ ...multiplied, write: true });
+    assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
+    assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+    assert.deepEqual(snapshot(cfg.stateDir), before);
+  }
+});
+
+test('completed words and empty scan pages do not reduce the multiplied retrieval window', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2, rpm: 1000, tpm: 1e9 });
+    const complete = (id) => entry(id, 'en', [{ id: `ipa-${id}`, transcription: '/a/', targets: ['es'] }]);
+    const db = fakeDatabase([complete('0'), complete('1'), entry('2'), complete('3'),
+      entry('4'), complete('5'), entry('6'), entry('7'), entry('8')], 1);
+    const batches = [];
+    const scanRequests = [];
+    const page = db.page;
+    db.page = async (args) => {
+      if (!args.includeCompleted) scanRequests.push(args.numItems);
+      return page(args);
+    };
+    const count = { calls: 0 };
+    const fetcher = fakeFetch(count);
+    const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      batches.push(JSON.parse(JSON.parse(options.body).input[1].content).words.map((job) => job.word));
+      return fetcher(url, options);
+    } });
+    await populate(task, cfg, db, ai, { log: () => {}, select: () => 0 });
+    assert.deepEqual(batches, task === 'transcriptions' ? [['word-2', 'word-4'], ['word-6', 'word-7'], ['word-8']] :
+      [['word-2', 'word-4'], ['word-2', 'word-4'], ['word-6', 'word-7'], ['word-6', 'word-7'], ['word-8'], ['word-8']]);
+    assert.equal(db.entries.at(-1).transcriptions.length, 1);
+    assert.deepEqual(scanRequests, [4, 4, 4, 3, 3, 2, 2, 1, 4]);
+  }
+});
+
+test('a retrieval window is processed in batches before the next window is read for both scripts', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2 });
+    const db = fakeDatabase([entry('1'), entry('2'), entry('3'), entry('4'), entry('5')].map((e, i) => task === 'respellings' ?
+      { ...e, transcriptions: [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
+    const events = [];
+    const page = db.page;
+    db.page = async (args) => { events.push(`read:${args.numItems}`); return page(args); };
+    const field = task === 'transcriptions' ? 'insertTranscriptions' : 'insertRespellings';
+    const insert = db[field];
+    db[field] = async (rows) => { events.push(`insert:${rows.length}`); return insert(rows); };
+    const count = { calls: 0 };
+    const fetcher = fakeFetch(count);
+    const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      events.push(`generate:${JSON.parse(JSON.parse(options.body).input[1].content).words.length}`);
+      return fetcher(url, options);
+    } });
+    await populate(task, cfg, db, ai, { log: () => {}, select: () => 0 });
+    assert.deepEqual(events, ['read:4', 'generate:2', 'insert:2', 'generate:2', 'insert:2',
+      'read:4', 'generate:1', 'insert:1']);
+  }
+});
+
+test('multiplicity 3 repeatedly retrieves 300 usable words and processes batches of 100 for both scripts', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write: true, batchSize: 100, batchSizeMultiplicity: 3, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase(Array.from({ length: 701 }, (_, i) => entry(String(i), 'en', task === 'respellings' ?
+      [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] : [])));
+    const events = [];
+    const page = db.page;
+    db.page = async (args) => { events.push(`read:${args.numItems}`); return page(args); };
+    const fetcher = fakeFetch({ calls: 0 });
+    const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      events.push(`generate:${JSON.parse(JSON.parse(options.body).input[1].content).words.length}`);
+      return fetcher(url, options);
+    } });
+    await populate(task, cfg, db, ai, { log: () => {}, select: () => 0 });
+    const fullWindow = [...Array(6).fill('read:50'), ...Array(3).fill('generate:100')];
+    assert.deepEqual(events, [...fullWindow, ...fullWindow, ...Array(3).fill('read:50'), 'generate:100', 'generate:1']);
+    assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+  }
+});
+
+test('extra usable rows are buffered without oversized AI batches or lost words', async () => {
+  for (const batchSizeMultiplicity of [1, 2, 3]) {
+    const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity });
+    const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
+    const page = db.page;
+    db.page = (args) => page({ ...args, numItems: 5 });
+    const batches = [];
+    const count = { calls: 0 };
+    const fetcher = fakeFetch(count);
+    await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      batches.push(JSON.parse(JSON.parse(options.body).input[1].content).words.map((job) => job.word));
+      return fetcher(url, options);
+    } }), { log: () => {} });
+    assert.deepEqual(batches, [['word-0', 'word-1'], ['word-2', 'word-3'], ['word-4']]);
+    assert.equal(db.calls.pages, 1);
+  }
+});
+
+test('IPA refreshes of an oversized read stay within the selected respelling batch', async () => {
+  const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2, rpm: 1000, tpm: 1e9 });
+  const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
+  const page = db.page;
+  db.page = (args) => page({ ...args, numItems: 5 });
+  const batches = [];
+  const fetcher = fakeFetch({ calls: 0 });
+  await populate('respellings', cfg, db, createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+    batches.push(JSON.parse(JSON.parse(options.body).input[1].content).words.map((job) => job.word));
+    return fetcher(url, options);
+  } }), { log: () => {}, select: () => 0 });
+  assert.deepEqual(batches, [['word-0', 'word-1'], ['word-0', 'word-1'], ['word-2', 'word-3'], ['word-2', 'word-3'],
+    ['word-4'], ['word-4']]);
+  assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+  assert.equal(db.calls.pages, 4); // One scan, three IPA-ID refreshes.
+});
+
+test('retrieval continues across source languages and multiple variants share one processing batch', async () => {
+  const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2 });
+  const db = fakeDatabase([entry('1'), entry('2', 'es'), entry('3', 'es'), entry('4', 'es'), entry('5', 'es')]);
+  const count = { calls: 0 };
+  await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count) }), { log: () => {} });
+  assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+
+  const respellingCfg = fixture({ write: true, batchSize: 1 });
+  const variants = fakeDatabase([entry('1', 'en', [
+    { id: 'ipa-1', transcription: '/a/', targets: [] },
+    { id: 'ipa-2', transcription: '/b/', targets: [] },
+    { id: 'ipa-3', transcription: '/c/', targets: [] },
+  ]), entry('2')]);
+  const requests = [];
+  const fetcher = fakeFetch({ calls: 0 });
+  await populate('respellings', respellingCfg, variants, createAI(respellingCfg, { log: () => {}, fetchFn: (url, options) => {
+    requests.push(JSON.parse(JSON.parse(options.body).input[1].content).words.length);
+    return fetcher(url, options);
+  } }), { log: () => {}, select: () => 0 });
+  assert.deepEqual(requests, [1, 1, 1, 1, 1]);
+  assert.ok(variants.entries[0].transcriptions.every((ipa) => ipa.targets.includes('es')));
+  assert.equal(variants.entries[1].transcriptions.length, 1);
 });
 
 test('duplicate pronunciation documents share one result and get separate database links', async () => {
   const cfg = fixture({ write: true });
   const db = fakeDatabase([entry('1', 'en', [
-    { _id: 'ipa-a', transcription: '/a/', targets: [] },
-    { _id: 'ipa-duplicate', transcription: '/a/', targets: [] },
-    { _id: 'ipa-b', transcription: '/b/', targets: [] },
+    { id: 'ipa-a', transcription: '/a/', targets: [] },
+    { id: 'ipa-duplicate', transcription: '/a/', targets: [] },
+    { id: 'ipa-b', transcription: '/b/', targets: [] },
   ])]);
   const count = { calls: 0 };
   const fetcher = fakeFetch(count);
@@ -919,15 +1090,90 @@ test('duplicate pronunciation documents share one result and get separate databa
   assert.deepEqual(readdirSync(cfg.stateDir), []);
 });
 
-test('an admitted batch finishes all reviews beyond the budget and is inserted before stopping', async () => {
-  const cfg = fixture({ write: true, budget: 1, batchSize: 1 });
-  const db = fakeDatabase([entry('1'), entry('2')]);
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
-    count.calls === 1 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+test('budget stops finish the active batch including missing IPA and reviews and leave prefetched batches untouched', async () => {
+  for (const task of ['transcriptions', 'respellings']) {
+    const callsPerBatch = task === 'transcriptions' ? 2 : 4;
+    for (const write of [false, true]) {
+      for (const budget of [1, 7150000, callsPerBatch * 7150000]) {
+        const cfg = fixture({ write, budget, batchSize: 2, batchSizeMultiplicity: 3, rpm: 1000, tpm: 1e9 });
+        const db = fakeDatabase(Array.from({ length: 7 }, (_, i) => entry(String(i))));
+        const reads = [];
+        const page = db.page;
+        db.page = async (args) => { reads.push(args); return page(args); };
+        const count = { calls: 0 };
+        const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
+          count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+        const logs = [];
+        await populate(task, cfg, db, ai, { log: (message) => logs.push(message), select: () => 0 });
+        assert.equal(count.calls, callsPerBatch);
+        assert.equal(ai.totals().committed, callsPerBatch * 7150000);
+        assert.deepEqual(reads.filter((args) => !args.includeCompleted).map((args) => args.numItems), [6]);
+        assert.match(logs.at(-1), /^Budget reached:/);
+        if (write) {
+          assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [1, 1, 0, 0, 0, 0, 0]);
+          if (task === 'respellings') assert.ok(db.entries.slice(0, 2).every((e) => e.transcriptions[0].targets.includes('es')));
+          assert.deepEqual(readdirSync(cfg.stateDir), []);
+        } else {
+          assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 2 : 4);
+          assert.ok(db.entries.every((e) => e.transcriptions.length === 0));
+        }
+        await assert.rejects(ai.runBatch(() => { throw new Error('A new batch must not start'); }), BudgetReachedError);
+      }
+    }
+  }
+});
+
+test('a respelling batch finishes every pronunciation variant and its reviews after exceeding the budget', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write, budget: 1, batchSize: 2, batchSizeMultiplicity: 3, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase([entry('0', 'en', ['a', 'b', 'c'].map((ipa) =>
+      ({ id: `ipa-${ipa}`, transcription: `/${ipa}/`, targets: [] }))),
+    ...Array.from({ length: 6 }, (_, i) => entry(String(i + 1)))]);
+    const count = { calls: 0 };
+    const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
+      count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Check pronunciation' } : r))) });
+    await populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 });
+    assert.equal(count.calls, 6); // IPA and two respelling requests, each with a review.
+    assert.equal(ai.totals().committed, 6 * 7150000);
+    if (write) {
+      assert.ok(db.entries.slice(0, 2).flatMap((e) => e.transcriptions).every((ipa) => ipa.targets.includes('es')));
+      assert.equal(db.entries[1].transcriptions.length, 1);
+    } else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 5);
+    assert.ok(db.entries.slice(2).every((e) => e.transcriptions.length === 0));
+  }
+});
+
+test('input splitting finishes the whole processing batch after exceeding the budget', async () => {
+  const cfg = fixture({ budget: 1, batchSize: 200, batchSizeMultiplicity: 2, rpm: 1000, tpm: 100000 });
+  const db = fakeDatabase(Array.from({ length: 401 }, (_, i) =>
+    ({ ...entry(String(i)), orthographic_form: `${i}-${'x'.repeat(480)}` })));
+  const requests = [];
+  let time = 100000;
+  const fetcher = fakeFetch({ calls: 0 });
+  const ai = createAI(cfg, { log: () => {}, now: () => time, wait: async (ms) => { time += ms; },
+    fetchFn: (url, options) => {
+      const body = JSON.parse(options.body);
+      assert.ok(reservation(body, cfg).tokens <= cfg.tpm);
+      requests.push(JSON.parse(body.input[1].content).words);
+      return fetcher(url, options);
+    },
+  });
   await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(count.calls, 2);
-  assert.equal(ai.totals().committed, 14300000);
-  assert.equal(db.entries.filter((e) => e.transcriptions.length).length, 1);
-  assert.deepEqual(readdirSync(cfg.stateDir), []);
+  assert.ok(requests.length > 1);
+  assert.deepEqual(requests.flat().map((job) => job.word), db.entries.slice(0, 200).map((e) => e.orthographic_form));
+  assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 200);
+  assert.ok(ai.totals().committed > cfg.budget);
+});
+
+test('failed processing releases the batch scope and budget checks still apply', async () => {
+  const cfg = fixture({ budget: 1 });
+  const count = { calls: 0 };
+  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
+  await assert.rejects(ai.runBatch(async () => {
+    await ai.generate('ipa', [{ key: '1', word: 'hello' }], source);
+    throw new Error('insertion failed');
+  }), /insertion failed/);
+  await assert.rejects(ai.generate('ipa', [{ key: '2', word: 'bye' }], source), BudgetReachedError);
+  await assert.rejects(ai.runBatch(() => { throw new Error('Must not start'); }), BudgetReachedError);
+  assert.equal(count.calls, 1);
 });

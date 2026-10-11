@@ -7,8 +7,11 @@
     "bun": ">=1.4.2"
   },
   "scripts": {
-    "transcriptions": "bun --env-file=.env.local ./populate-transcriptions.mjs",
-    "respellings": "bun --env-file=.env.local ./populate-respellings.mjs",
+    "transcriptions": "bun --env-file=.env.local ./scripts/generators/populate-transcriptions.mjs",
+    "respellings": "bun --env-file=.env.local ./scripts/generators/populate-respellings.mjs",
     "test": "bun test"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
   }
 }
