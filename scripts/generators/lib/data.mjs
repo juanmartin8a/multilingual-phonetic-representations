@@ -77,7 +77,7 @@ export function validateOrderedRecords(output, jobs, task, target) {
       try { validateRecord(record, task, target); }
       catch (error) { reason = error.message; }
     }
-    if (reason) rejected.push({ index, job, reason, returned: row ?? null });
+    if (reason) rejected.push({ job, reason, returned: row ?? null });
     else records.push(record);
   }
   return { records, rejected };

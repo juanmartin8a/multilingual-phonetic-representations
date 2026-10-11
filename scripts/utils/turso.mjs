@@ -13,7 +13,7 @@ export function tursoSettings(env = process.env) {
     throw new Error('TURSO_AUTH_TOKEN is missing; load credentials with bun --env-file=.env.local');
   }
   // Both URL schemes identify the same remote database and use HTTPS transport.
-  return { url: `https://${url.host}`, authToken: env.TURSO_AUTH_TOKEN };
+  return { url: new URL(`https://${url.host}`).origin, authToken: env.TURSO_AUTH_TOKEN };
 }
 
 export function connectTurso(settings, { fetchFn = fetch, timeout = 60000, createClientFn = createClient } = {}) {

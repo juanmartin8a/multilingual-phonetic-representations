@@ -106,30 +106,22 @@ export async function populate(task, cfg, db, ai, { log = console.log, select = 
     log(`Budget reached: $${(ai.totals().committed / 1e9).toFixed(6)} committed this run; $${(cfg.budget / 1e9).toFixed(6)} limit. Completed batches ${cfg.write ? 'inserted' : 'saved locally'}; rerun for a fresh budget.`);
   }
   for (const language of ordered) {
-    let cursor = null, buffered = null, exhausted = false;
-    while (buffered || !exhausted) {
+    let cursor = null, exhausted = false;
+    while (!exhausted) {
       if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
       const pending = [];
       let words = 0;
-      while (words < windowSize && (buffered || !exhausted)) {
-        if (!buffered) {
-          const args = { languageCode: language.language_code, cursor, numItems: Math.min(50, windowSize - words),
-            ...(target ? { targetLanguageCode: target.code } : {}) };
-          const result = await db.page(args);
-          if (!result.isDone && result.continueCursor === cursor) throw new Error('Pagination did not advance');
-          // Only words needing this task count toward the retrieval window.
-          const usable = result.page.filter((entry) => entry.transcriptions.length === 0 ||
-            (target && entry.transcriptions.some((t) => !t.hasRespelling)));
-          cursor = result.continueCursor;
-          exhausted = result.isDone;
-          if (!usable.length) continue;
-          buffered = { args, result: { ...result, page: usable } };
-        }
-        const page = buffered.result.page.slice(0, windowSize - words);
-        pending.push({ args: buffered.args, result: { ...buffered.result, page } });
-        words += page.length;
-        const remainder = buffered.result.page.slice(page.length);
-        buffered = remainder.length ? { ...buffered, result: { ...buffered.result, page: remainder } } : null;
+      while (words < windowSize && !exhausted) {
+        const args = { languageCode: language.language_code, cursor, numItems: Math.min(50, windowSize - words),
+          ...(target ? { targetLanguageCode: target.code } : {}) };
+        const result = await db.page(args);
+        if (!result.isDone && result.continueCursor === cursor) throw new Error('Pagination did not advance');
+        cursor = result.continueCursor;
+        exhausted = result.isDone;
+        // The adapter returns at most numItems words needing the selected task.
+        if (!result.page.length) continue;
+        pending.push({ args, result });
+        words += result.page.length;
       }
       if (!words) break;
       for (const batch of processingBatches(pending, cfg.batchSize)) {

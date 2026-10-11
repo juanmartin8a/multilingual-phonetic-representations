@@ -25,7 +25,7 @@ export function usageCost(body, prices, api, requireCacheWrites = false) {
   const reasoning = (api === 'responses' ? usage.output_tokens_details : usage.completion_tokens_details)?.reasoning_tokens ?? 0;
   if (![input, output, cached, written, reasoning].every((n) => Number.isSafeInteger(n) && n >= 0) ||
       cached + written > input || reasoning > output) throw new Error('Inconsistent provider token usage');
-  if (input > 272000) throw new Error('Unexpected long-context pricing tier; stop and reconcile billing');
+  if (input > MAX_INPUT_RESERVATION) throw new Error('Unexpected long-context pricing tier; stop and reconcile billing');
   if (body.service_tier && !['default', 'standard'].includes(body.service_tier)) throw new Error('Unexpected paid service tier');
   const cost = (input - cached - written) * prices.input + cached * prices.cached +
     written * prices.write + output * prices.output;

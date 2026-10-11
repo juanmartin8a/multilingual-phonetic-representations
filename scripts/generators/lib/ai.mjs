@@ -5,7 +5,7 @@ import { createGateway, MAX_INPUT_RESERVATION, reservedInput, outputText,
   requestBody as gatewayRequestBody } from '../../utils/ai-gateway.mjs';
 import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, validateRecord, validateOrderedRecords } from './data.mjs';
 
-export function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
+function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
   const words = input.words.map((job, index) => ({ index, word: job.word,
     ...(job.ipa !== undefined ? { ipa: job.ipa } : {}),
     ...(job.note !== undefined ? { note: job.note } : {}) }));

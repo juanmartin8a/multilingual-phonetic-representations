@@ -18,10 +18,9 @@ import { connectTurso, tursoSettings, withTransaction } from './scripts/utils/tu
 
 const client = connectTurso(tursoSettings());
 try {
-  const result = await client.execute({ sql: 'SELECT name FROM languages WHERE id = ?', args: ['language-id'] });
-  await withTransaction(client, 'write', async (transaction) => {
-    // Run the script's own parameterized statements here.
-  });
+  const result = await withTransaction(client, 'read', (transaction) =>
+    transaction.execute({ sql: 'SELECT name FROM languages WHERE id = ?', args: ['language-id'] }));
+  console.log(result.rows);
 } finally {
   client.close();
 }

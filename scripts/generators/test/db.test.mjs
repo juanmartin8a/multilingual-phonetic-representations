@@ -1,7 +1,7 @@
 import { test, afterEach } from 'bun:test';
 import assert from 'node:assert/strict';
 import { createClient } from '@libsql/client';
-import { readFileSync, mkdtempSync, rmSync, readdirSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPopulationDatabase } from '../lib/db.mjs';
@@ -114,10 +114,11 @@ test('Turso population adapter reads without allowing accidental writes in defau
 
 test('both generators reuse local results and then insert into real SQL tables with bounded batches', async () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const { client } = await fixture();
+    const words = Array.from({ length: 103 }, (_, index) => `word-${String(index).padStart(3, '0')}`);
+    const { client } = await fixture({ words });
     const stateDir = mkdtempSync(join(tmpdir(), 'sapo-turso-'));
     directories.push(stateDir);
-    const cfg = { stateDir, databaseUrl: 'https://test.turso.io', batchSize: 2, batchSizeMultiplicity: 2,
+    const cfg = { stateDir, databaseUrl: 'https://test.turso.io', batchSize: 100, batchSizeMultiplicity: 2,
       provider: 'openai', api: 'responses', model: 'test', builtIn: false, effort: 'omit', outputTokens: 1000,
       account: 'a'.repeat(32), gateway: 'test', token: 'fake', rpm: 1000, tpm: 1e9, attempts: 1,
       timeout: 1000, budget: 1e9, prices: { input: 1000, cached: 1000, write: 1000, output: 1000 } };
@@ -132,18 +133,32 @@ test('both generators reuse local results and then insert into real SQL tables w
     const local = createPopulationDatabase(client);
     await populate(task, cfg, local, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
     assert.equal(await count(client, 'phonetic_transcriptions'), 0);
-    const files = readdirSync(join(stateDir, 'results'));
+    const snapshot = () => Object.fromEntries(readdirSync(stateDir, { recursive: true, withFileTypes: true })
+      .filter((file) => file.isFile()).map((file) => {
+        const path = join(file.parentPath, file.name);
+        const info = statSync(path);
+        return [path, { contents: readFileSync(path, 'utf8'), inode: info.ino, modified: info.mtimeMs }];
+      }));
+    const before = snapshot();
     const generatedCalls = calls;
     const writable = { ...cfg, write: true };
     const db = createPopulationDatabase(client, writable);
+    const batchSizes = { ipa: [], respell: [] };
+    for (const [kind, method] of [['ipa', 'insertTranscriptions'], ['respell', 'insertRespellings']]) {
+      const insert = db[method];
+      db[method] = async (rows) => { batchSizes[kind].push(rows.length); return insert(rows); };
+    }
     await populate(task, writable, db, createAI(writable, dependencies), { select: () => 0, log: () => {} });
     assert.equal(calls, generatedCalls);
-    assert.equal(await count(client, 'phonetic_transcriptions'), 5);
-    assert.equal(await count(client, 'pronunciation_respellings'), task === 'respellings' ? 5 : 0);
-    assert.deepEqual(readdirSync(join(stateDir, 'results')), files);
+    assert.equal(await count(client, 'phonetic_transcriptions'), words.length);
+    assert.equal(await count(client, 'pronunciation_respellings'), task === 'respellings' ? words.length : 0);
+    assert.deepEqual(batchSizes.ipa, [50, 50, 3]);
+    assert.deepEqual(batchSizes.respell, task === 'respellings' ? [50, 50, 3] : []);
+    assert.deepEqual(snapshot(), before);
     await populate(task, writable, db, createAI(writable, dependencies), { select: () => 0, log: () => {} });
     assert.equal(calls, generatedCalls);
-    assert.equal(await count(client, 'phonetic_transcriptions'), 5);
+    assert.equal(await count(client, 'phonetic_transcriptions'), words.length);
+    assert.deepEqual(snapshot(), before);
     assert.deepEqual((await client.execute('PRAGMA foreign_key_check')).rows, []);
   }
 });

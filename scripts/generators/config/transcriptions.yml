@@ -15,7 +15,7 @@ ai:
   api: responses
   reasoningEffort: medium
   maxOutputTokens: 25000
-  # Standard, non-regional GPT-6.1 Sol prices, USD/million tokens (2026-10-08).
+  # Prices for the configured model, USD/million tokens.
   # Change model and all four prices together; use your actual OpenAI rates.
   pricesUsdPerMillion:
     input: "0.1"
