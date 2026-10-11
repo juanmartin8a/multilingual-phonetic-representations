@@ -4,19 +4,29 @@ import { languagePolicy, validIpa, validRespelling } from './data.mjs';
 
 const placeholders = (rows) => rows.map(() => '?').join(', ');
 
-function pageCursor(cursor, languageCode) {
-  if (cursor === null || cursor === undefined) return null;
-  let value;
-  try { value = JSON.parse(cursor); } catch { throw new Error('Invalid page cursor'); }
-  if (!Array.isArray(value) || value.length !== 3 || value.some((part) => typeof part !== 'string') ||
-      value[0] !== languageCode) throw new Error('Invalid page cursor for language');
-  return value.slice(1);
+const entryIds = (entries) => JSON.stringify(entries.map((entry) => entry.id));
+
+async function withTranscriptions(transaction, entries, targetLanguageId) {
+  if (!entries.length) return [];
+  const result = await transaction.execute({
+    sql: `SELECT p.id, p.entry_id, p.transcription,
+      EXISTS (SELECT 1 FROM pronunciation_respellings r
+        WHERE r.phonetic_transcription_id = p.id AND r.target_language_id = ?) AS hasRespelling
+      FROM phonetic_transcriptions p WHERE p.type = 'ipa'
+        AND p.entry_id IN (SELECT value FROM json_each(?)) ORDER BY p.created_at, p.id`,
+    args: [targetLanguageId, entryIds(entries)],
+  });
+  const byEntry = new Map(entries.map((entry) => [entry.id, []]));
+  for (const row of result.rows) byEntry.get(row.entry_id).push({
+    id: row.id, transcription: row.transcription, hasRespelling: Boolean(row.hasRespelling),
+  });
+  return entries.map((entry) => ({ ...entry, transcriptions: byEntry.get(entry.id) }));
 }
 
 export function createPopulationDatabase(client, { write = false, languagePolicies = {} } = {}) {
   function checkWrite(rows) {
     if (!write) throw new Error('Database writes require --write');
-    if (!Array.isArray(rows) || rows.length > 50) throw new Error('Insert batches must contain at most 50 records');
+    if (!Array.isArray(rows) || rows.length > 1000) throw new Error('Insert batches must contain at most 1000 records');
   }
 
   return {
@@ -28,42 +38,42 @@ export function createPopulationDatabase(client, { write = false, languagePolici
       return result.rows.map((row) => ({ id: row.id, language_code: row.language_code,
         name: row.name, hasEntries: Boolean(row.hasEntries) }));
     },
-    async page({ languageCode, cursor = null, numItems, targetLanguageCode = null, includeCompleted = false }) {
-      if (!Number.isSafeInteger(numItems) || numItems < 1 || numItems > 50) throw new Error('Page size must be from 1 to 50');
-      const after = pageCursor(cursor, languageCode);
+    async pendingEntries({ languageId, after = null, limit, targetLanguageId = null }) {
+      if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('Retrieval limit must be a positive safe integer');
+      if (after !== null && (!Array.isArray(after) || after.length !== 2 ||
+          after.some((part) => typeof part !== 'string'))) throw new Error('Invalid continuation marker');
       return withTransaction(client, 'read', async (transaction) => {
-        // Scan a stable range, then filter completed words. IPA insertion must
-        // not change cursor boundaries when this page is refreshed.
         const result = await transaction.execute({
           sql: `SELECT e.id, e.orthographic_form, e.language_id FROM entries e
-            WHERE e.language_id = (SELECT id FROM languages WHERE language_code = ?)
+            WHERE e.language_id = ?
             ${after ? 'AND (e.orthographic_form, e.id) > (?, ?)' : ''}
+            AND (NOT EXISTS (SELECT 1 FROM phonetic_transcriptions p WHERE p.entry_id = e.id AND p.type = 'ipa')
+              ${targetLanguageId !== null ? `OR EXISTS (SELECT 1 FROM phonetic_transcriptions p
+                WHERE p.entry_id = e.id AND p.type = 'ipa' AND NOT EXISTS
+                  (SELECT 1 FROM pronunciation_respellings r
+                    WHERE r.phonetic_transcription_id = p.id AND r.target_language_id = ?))` : ''})
             ORDER BY e.orthographic_form, e.id LIMIT ?`,
-          args: [languageCode, ...(after ?? []), numItems + 1],
+          args: [languageId, ...(after ?? []), ...(targetLanguageId !== null ? [targetLanguageId] : []), limit],
         });
-        const scanned = result.rows.slice(0, numItems);
-        const isDone = result.rows.length <= numItems;
-        const last = scanned.at(-1);
-        const continueCursor = last ? JSON.stringify([languageCode, last.orthographic_form, last.id]) : cursor;
-        if (!scanned.length) return { page: [], continueCursor, isDone };
-        const transcriptions = await transaction.execute({
-          sql: `SELECT p.id, p.entry_id, p.transcription,
-            EXISTS (SELECT 1 FROM pronunciation_respellings r
-              WHERE r.phonetic_transcription_id = p.id AND r.target_language_id =
-                (SELECT id FROM languages WHERE language_code = ?)) AS hasRespelling
-            FROM phonetic_transcriptions p WHERE p.type = 'ipa' AND p.entry_id IN (${placeholders(scanned)})
-            ORDER BY p.created_at, p.id`,
-          args: [targetLanguageCode, ...scanned.map((entry) => entry.id)],
+        return targetLanguageId === null ? result.rows.map((entry) => ({ ...entry, transcriptions: [] })) :
+          withTranscriptions(transaction, result.rows, targetLanguageId);
+      });
+    },
+    async refreshEntries(entries, targetLanguageId = null) {
+      if (!entries.length) return [];
+      return withTransaction(client, 'read', async (transaction) => {
+        const result = await transaction.execute({
+          sql: 'SELECT id, orthographic_form, language_id FROM entries WHERE id IN (SELECT value FROM json_each(?))',
+          args: [entryIds(entries)],
         });
-        const byEntry = new Map(scanned.map((entry) => [entry.id, []]));
-        for (const row of transcriptions.rows) {
-          byEntry.get(row.entry_id).push({ id: row.id, transcription: row.transcription, hasRespelling: Boolean(row.hasRespelling) });
+        const current = new Map(result.rows.map((entry) => [entry.id, entry]));
+        for (const entry of entries) {
+          const saved = current.get(entry.id);
+          if (!saved || saved.orthographic_form !== entry.orthographic_form || saved.language_id !== entry.language_id) {
+            throw new Error('Entry changed before IPA refresh');
+          }
         }
-        const entries = scanned.map((entry) => ({ id: entry.id, orthographic_form: entry.orthographic_form,
-          language_id: entry.language_id, language_code: languageCode, transcriptions: byEntry.get(entry.id) }));
-        const page = includeCompleted ? entries : entries.filter((entry) => !entry.transcriptions.length ||
-          (targetLanguageCode && entry.transcriptions.some((ipa) => !ipa.hasRespelling)));
-        return { page, continueCursor, isDone };
+        return withTranscriptions(transaction, entries, targetLanguageId);
       });
     },
     async insertTranscriptions(rows) {
@@ -101,7 +111,11 @@ export function createPopulationDatabase(client, { write = false, languagePolici
           args: rows.map((row) => row.phonetic_transcription_id),
         });
         const pronunciations = new Map(existing.rows.map((ipa) => [ipa.id, ipa]));
-        const targets = await transaction.execute('SELECT id, language_code, name FROM languages');
+        const targetIds = [...new Set(rows.map((row) => row.target_language_id))];
+        const targets = await transaction.execute({
+          sql: `SELECT id, language_code, name FROM languages WHERE id IN (${placeholders(targetIds)})`,
+          args: targetIds,
+        });
         const languages = new Map(targets.rows.map((language) => [language.id, language]));
         for (const row of rows) {
           const ipa = pronunciations.get(row.phonetic_transcription_id);

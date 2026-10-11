@@ -17,7 +17,7 @@ afterEach(() => {
 async function fixture({ write = true, words = ['a', 'a', 'b', 'c', 'd'] } = {}) {
   const client = createClient({ url: ':memory:' });
   clients.push(client);
-  await client.executeMultiple(readFileSync(new URL('./fixtures/turso.sql', import.meta.url), 'utf8'));
+  await client.executeMultiple(readFileSync(new URL('../../../database/schema.sql', import.meta.url), 'utf8'));
   await client.batch([
     { sql: 'INSERT INTO languages VALUES (?, ?, ?, ?)', args: ['en', 0, 'en', 'English'] },
     { sql: 'INSERT INTO languages VALUES (?, ?, ?, ?)', args: ['es', 0, 'es', 'Spanish'] },
@@ -36,29 +36,91 @@ const respellingRow = (id, word = 'a', transcription = '/a/') => ({ phonetic_tra
 const count = async (client, table) => (await client.execute(`SELECT count(*) AS count FROM ${table}`)).rows[0].count;
 
 // Exercise the actual SQL against the migrated schema, including duplicate words.
-test('Turso pagination keeps stable boundaries after IPA insertion and advances over completed pages', async () => {
+test('SQL filters missing words before LIMIT and continues past duplicate spellings', async () => {
   const { db } = await fixture();
   assert.deepEqual((await db.languages()).map((language) => [language.id, language.hasEntries]),
     [['en', true], ['es', false], ['fr', false]]);
-  const args = { languageCode: 'en', numItems: 2 };
-  const first = await db.page(args);
-  assert.deepEqual(first.page.map((entry) => entry.id), ['e0', 'e1']);
+  const args = { languageId: 'en', limit: 2 };
+  const first = await db.pendingEntries(args);
+  assert.deepEqual(first.map((entry) => entry.id), ['e0', 'e1']);
+  // Local mode leaves the same words missing; a marker advances without OFFSET.
+  const second = await db.pendingEntries({ ...args, after: [first[1].orthographic_form, first[1].id] });
+  assert.deepEqual(second.map((entry) => entry.id), ['e2', 'e3']);
+  const last = await db.pendingEntries({ ...args, after: ['c', 'e3'] });
+  assert.deepEqual(last.map((entry) => entry.id), ['e4']);
   await db.insertTranscriptions([ipaRow('e0'), ipaRow('e1')]);
-  const completed = await db.page(args);
-  assert.deepEqual(completed.page, []);
-  assert.equal(completed.continueCursor, first.continueCursor);
-  assert.equal(completed.isDone, first.isDone);
-  const refreshed = await db.page({ ...args, includeCompleted: true });
-  assert.deepEqual(refreshed.page.map((entry) => entry.id), ['e0', 'e1']);
-  assert.ok(refreshed.page.every((entry) => entry.transcriptions[0].id));
-  const second = await db.page({ ...args, cursor: first.continueCursor });
-  assert.deepEqual(second.page.map((entry) => entry.id), ['e2', 'e3']);
-  const last = await db.page({ ...args, cursor: second.continueCursor });
-  assert.deepEqual(last.page.map((entry) => entry.id), ['e4']);
-  assert.equal(last.isDone, true);
-  await assert.rejects(db.page({ ...args, languageCode: 'es', cursor: first.continueCursor }), /cursor/);
-  await assert.rejects(db.page({ ...args, cursor: 'bad' }), /cursor/);
-  await assert.rejects(db.page({ ...args, numItems: 51 }), /Page size/);
+  assert.deepEqual((await db.pendingEntries(args)).map((entry) => entry.id), ['e2', 'e3']);
+  const refreshed = await db.refreshEntries(first, 'es');
+  assert.deepEqual(refreshed.map((entry) => entry.id), ['e0', 'e1']);
+  assert.ok(refreshed.every((entry) => entry.transcriptions[0].id));
+  await assert.rejects(db.pendingEntries({ ...args, after: 'bad' }), /continuation marker/);
+  await assert.rejects(db.pendingEntries({ ...args, limit: 0 }), /Retrieval limit/);
+});
+
+test('SQL retrieves a full window beyond 50 words and includes every missing IPA variant', async () => {
+  const words = Array.from({ length: 170 }, (_, i) => `word-${String(i).padStart(3, '0')}`);
+  const { client, db } = await fixture({ words });
+  const originals = await db.pendingEntries({ languageId: 'en', limit: 70 });
+  await db.insertTranscriptions(originals.map((e) => ipaRow(e.id, e.orthographic_form)));
+  const withIpa = await db.refreshEntries(originals, 'es');
+  await db.insertRespellings(withIpa.map((e) => respellingRow(e.transcriptions[0].id, e.orthographic_form)));
+  for (const targetLanguageId of [null, 'es']) {
+    const window = await db.pendingEntries({ languageId: 'en', targetLanguageId, limit: 100 });
+    assert.equal(window.length, 100);
+    assert.equal(window[0].id, 'e70');
+    assert.equal(window.at(-1).id, 'e169');
+    assert.deepEqual(await db.pendingEntries({ languageId: 'en', targetLanguageId,
+      after: [window.at(-1).orthographic_form, window.at(-1).id], limit: 100 }), []);
+  }
+  await client.execute("INSERT INTO phonetic_transcriptions VALUES ('variant', 0, 'e0', 'ipa', '/b/')");
+  const [word] = await db.pendingEntries({ languageId: 'en', targetLanguageId: 'es', limit: 1 });
+  assert.equal(word.id, 'e0');
+  assert.equal(word.transcriptions.length, 2);
+  assert.equal(word.transcriptions.filter((ipa) => !ipa.hasRespelling).length, 1);
+});
+
+test('IPA refresh uses entry identity rather than neighboring words and rejects changed or deleted entries', async () => {
+  const { client, db } = await fixture();
+  const selected = await db.pendingEntries({ languageId: 'en', limit: 2 });
+  await db.insertTranscriptions(selected.map((e) => ipaRow(e.id, e.orthographic_form)));
+  await client.execute("INSERT INTO entries VALUES ('neighbor', 0, 'a', 1, 'en')");
+  const refreshed = await db.refreshEntries(selected, 'es');
+  assert.deepEqual(refreshed.map((e) => e.id), selected.map((e) => e.id));
+  await client.execute("UPDATE entries SET orthographic_form = 'changed' WHERE id = 'e0'");
+  await assert.rejects(db.refreshEntries(selected, 'es'), /Entry changed/);
+  await client.execute("UPDATE entries SET orthographic_form = 'a', language_id = 'fr' WHERE id = 'e0'");
+  await assert.rejects(db.refreshEntries(selected, 'es'), /Entry changed/);
+  const unpopulated = await db.pendingEntries({ languageId: 'en', limit: 10 });
+  await client.execute({ sql: 'DELETE FROM entries WHERE id = ?', args: [unpopulated[0].id] });
+  await assert.rejects(db.refreshEntries(unpopulated, 'es'), /Entry changed/);
+});
+
+test('the schema prevents duplicate guides and the existing-database migration preserves records', async () => {
+  const { client, db } = await fixture();
+  await db.insertTranscriptions([ipaRow('e0')]);
+  const [word] = await db.pendingEntries({ languageId: 'en', targetLanguageId: 'es', limit: 1 });
+  await db.insertRespellings([respellingRow(word.transcriptions[0].id)]);
+  const duplicate = `INSERT INTO pronunciation_respellings
+    SELECT 'duplicate', created_at, entry_id, phonetic_transcription_id, target_language_id,
+      type, respelling, source_language_id FROM pronunciation_respellings LIMIT 1`;
+  await assert.rejects(client.execute(duplicate), /UNIQUE/);
+  await client.execute('DROP INDEX pronunciation_respellings_unique_target');
+  await client.execute(`CREATE INDEX pronunciation_respellings_by_phonetic_transcription_and_target
+    ON pronunciation_respellings(phonetic_transcription_id, target_language_id)`);
+  await client.execute(duplicate);
+  const migration = readFileSync(new URL('../../../database/migrations/001_unique_respelling_target.sql', import.meta.url), 'utf8');
+  await assert.rejects(client.executeMultiple(migration), /UNIQUE/);
+  assert.equal(await count(client, 'pronunciation_respellings'), 2);
+  assert.ok((await client.execute("PRAGMA index_list('pronunciation_respellings')")).rows
+    .some((index) => index.name === 'pronunciation_respellings_by_phonetic_transcription_and_target'));
+  await client.execute("DELETE FROM pronunciation_respellings WHERE id = 'duplicate'");
+  await client.executeMultiple(migration);
+  await client.executeMultiple(migration); // Safe to apply again.
+  assert.equal(await count(client, 'pronunciation_respellings'), 1);
+  await assert.rejects(client.execute(duplicate), /UNIQUE/);
+  const indexes = (await client.execute("PRAGMA index_list('pronunciation_respellings')")).rows;
+  assert.ok(indexes.some((index) => index.name === 'pronunciation_respellings_unique_target' && index.unique));
+  assert.ok(!indexes.some((index) => index.name === 'pronunciation_respellings_by_phonetic_transcription_and_target'));
 });
 
 test('Turso IPA inserts are idempotent, preserve variants, validate stale identities, and roll back a failed batch', async () => {
@@ -84,18 +146,18 @@ test('Turso respellings link every IPA variant, skip existing targets, and valid
   const { client, db } = await fixture();
   await db.insertTranscriptions([ipaRow('e0')]);
   await client.execute({ sql: 'INSERT INTO phonetic_transcriptions VALUES (?, ?, ?, ?, ?)', args: ['variant', 0, 'e0', 'ipa', '/a/'] });
-  const before = await db.page({ languageCode: 'en', targetLanguageCode: 'es', numItems: 1 });
-  const rows = before.page[0].transcriptions.map((ipa) => respellingRow(ipa.id));
+  const before = await db.pendingEntries({ languageId: 'en', targetLanguageId: 'es', limit: 1 });
+  const rows = before[0].transcriptions.map((ipa) => respellingRow(ipa.id));
   await db.insertRespellings([...rows, rows[0]]);
   await db.insertRespellings(rows);
   assert.equal(await count(client, 'pronunciation_respellings'), 2);
   const saved = (await client.execute('SELECT * FROM pronunciation_respellings')).rows;
   assert.ok(saved.every((row) => row.entry_id === 'e0' && row.source_language_id === 'en' &&
     row.target_language_id === 'es' && row.type === 'cross-lingual' && row.created_at > 0));
-  const completed = await db.page({ languageCode: 'en', targetLanguageCode: 'es', numItems: 1 });
-  assert.deepEqual(completed.page, []);
-  const anotherTarget = await db.page({ languageCode: 'en', targetLanguageCode: 'fr', numItems: 1 });
-  assert.ok(anotherTarget.page[0].transcriptions.every((ipa) => !ipa.hasRespelling));
+  const completed = await db.pendingEntries({ languageId: 'en', targetLanguageId: 'es', limit: 1 });
+  assert.equal(completed[0].id, 'e1');
+  const anotherTarget = await db.pendingEntries({ languageId: 'en', targetLanguageId: 'fr', limit: 1 });
+  assert.ok(anotherTarget[0].transcriptions.every((ipa) => !ipa.hasRespelling));
   await assert.rejects(db.insertRespellings([{ ...rows[0], transcription: '/wrong/' }]), /Pronunciation changed/);
   await assert.rejects(db.insertRespellings([{ ...rows[0], target_language_id: 'en', target_language_code: 'en' }]), /Invalid target/);
   await assert.rejects(db.insertRespellings([{ ...rows[0], target_language_code: 'fr' }]), /Invalid target/);
@@ -105,14 +167,14 @@ test('Turso respellings link every IPA variant, skip existing targets, and valid
 
 test('Turso population adapter reads without allowing accidental writes in default mode', async () => {
   const { client, db } = await fixture({ write: false });
-  assert.equal((await db.page({ languageCode: 'en', numItems: 2 })).page.length, 2);
+  assert.equal((await db.pendingEntries({ languageId: 'en', limit: 2 })).length, 2);
   await assert.rejects(db.insertTranscriptions([ipaRow('e0')]), /require --write/);
   await assert.rejects(db.insertRespellings([respellingRow('missing')]), /require --write/);
   assert.equal(await count(client, 'phonetic_transcriptions'), 0);
   assert.equal(await count(client, 'pronunciation_respellings'), 0);
 });
 
-test('both generators reuse local results and then insert into real SQL tables with bounded batches', async () => {
+test('both generators reuse local results and then insert into real SQL tables with writes sized by configuration', async () => {
   for (const task of ['transcriptions', 'respellings']) {
     const words = Array.from({ length: 103 }, (_, index) => `word-${String(index).padStart(3, '0')}`);
     const { client } = await fixture({ words });
@@ -152,8 +214,8 @@ test('both generators reuse local results and then insert into real SQL tables w
     assert.equal(calls, generatedCalls);
     assert.equal(await count(client, 'phonetic_transcriptions'), words.length);
     assert.equal(await count(client, 'pronunciation_respellings'), task === 'respellings' ? words.length : 0);
-    assert.deepEqual(batchSizes.ipa, [50, 50, 3]);
-    assert.deepEqual(batchSizes.respell, task === 'respellings' ? [50, 50, 3] : []);
+    assert.deepEqual(batchSizes.ipa, [100, 3]);
+    assert.deepEqual(batchSizes.respell, task === 'respellings' ? [100, 3] : []);
     assert.deepEqual(snapshot(), before);
     await populate(task, writable, db, createAI(writable, dependencies), { select: () => 0, log: () => {} });
     assert.equal(calls, generatedCalls);

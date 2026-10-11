@@ -7,30 +7,15 @@ import { connect } from './db.mjs';
 import { createAI } from './ai.mjs';
 import { BudgetReachedError } from '../../utils/ai-gateway.mjs';
 
-async function insertBatches(insert, rows) {
-  for (let offset = 0; offset < rows.length; offset += 50) await insert(rows.slice(offset, offset + 50));
+async function insertBatches(insert, rows, size) {
+  for (const batch of batches(rows, size)) await insert(batch);
 }
 
-function* processingBatches(pages, size) {
-  let batch = [], words = 0;
-  for (const page of pages) {
-    for (let offset = 0; offset < page.result.page.length;) {
-      const entries = page.result.page.slice(offset, offset + size - words);
-      batch.push({ args: page.args, result: { ...page.result, page: entries } });
-      words += entries.length;
-      offset += entries.length;
-      if (words === size) {
-        yield batch;
-        batch = [];
-        words = 0;
-      }
-    }
-  }
-  if (words) yield batch;
+function* batches(items, size) {
+  for (let offset = 0; offset < items.length; offset += size) yield items.slice(offset, offset + size);
 }
 
-async function processPages(cfg, db, ai, pages, source, target, log) {
-  let entries = pages.flatMap(({ result }) => result.page);
+async function processBatch(cfg, db, ai, entries, source, target, log) {
   const missing = entries.filter((entry) => entry.transcriptions.length === 0);
   const pending = entries.reduce((sum, entry) => sum + entry.transcriptions.filter((t) => !t.hasRespelling).length, 0);
   log(`${source.code}: ${entries.length} words, ${missing.length} missing IPA` +
@@ -43,21 +28,12 @@ async function processPages(cfg, db, ai, pages, source, target, log) {
         const entry = byId.get(record.key);
         return { entry_id: entry.id, orthographic_form: entry.orthographic_form,
           language_id: entry.language_id, language_code: source.code, transcription: record.value };
-      }));
+      }), cfg.batchSize);
     });
   if (!target) return;
   if (cfg.write && missing.length) {
-    // Resolve real IPA IDs after insertion before linking respellings.
-    const refreshed = [];
-    for (const page of pages) {
-      const result = await db.page({ ...page.args, includeCompleted: true });
-      if (result.continueCursor !== page.result.continueCursor || result.isDone !== page.result.isDone) {
-        throw new Error('Entries changed during this page; rerun before generating respellings');
-      }
-      const ids = new Set(page.result.page.map((entry) => entry.id));
-      refreshed.push(...result.page.filter((entry) => ids.has(entry.id)));
-    }
-    entries = refreshed;
+    const refreshed = new Map((await db.refreshEntries(missing, cfg.targetId)).map((entry) => [entry.id, entry]));
+    entries = entries.map((entry) => refreshed.get(entry.id) ?? entry);
   } else if (!cfg.write) {
     entries = entries.map((entry) => ({ ...entry,
       transcriptions: entry.transcriptions.length ? entry.transcriptions : ipa.has(entry.id) ?
@@ -77,7 +53,7 @@ async function processPages(cfg, db, ai, pages, source, target, log) {
         phonetic_transcription_id: transcription.id, transcription: transcription.transcription,
         orthographic_form: entry.orthographic_form, source_language_code: source.code,
         target_language_id: cfg.targetId, target_language_code: target.code, respelling: values.get(key),
-      })));
+      })), cfg.batchSize);
   });
 }
 
@@ -106,27 +82,17 @@ export async function populate(task, cfg, db, ai, { log = console.log, select = 
     log(`Budget reached: $${(ai.totals().committed / 1e9).toFixed(6)} committed this run; $${(cfg.budget / 1e9).toFixed(6)} limit. Completed batches ${cfg.write ? 'inserted' : 'saved locally'}; rerun for a fresh budget.`);
   }
   for (const language of ordered) {
-    let cursor = null, exhausted = false;
-    while (!exhausted) {
+    let after = null;
+    while (true) {
       if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
-      const pending = [];
-      let words = 0;
-      while (words < windowSize && !exhausted) {
-        const args = { languageCode: language.language_code, cursor, numItems: Math.min(50, windowSize - words),
-          ...(target ? { targetLanguageCode: target.code } : {}) };
-        const result = await db.page(args);
-        if (!result.isDone && result.continueCursor === cursor) throw new Error('Pagination did not advance');
-        cursor = result.continueCursor;
-        exhausted = result.isDone;
-        // The adapter returns at most numItems words needing the selected task.
-        if (!result.page.length) continue;
-        pending.push({ args, result });
-        words += result.page.length;
-      }
-      if (!words) break;
-      for (const batch of processingBatches(pending, cfg.batchSize)) {
+      const pending = await db.pendingEntries({ languageId: language.id, after, limit: windowSize,
+        targetLanguageId: target ? cfg.targetId : null });
+      if (!pending.length) break;
+      const last = pending.at(-1);
+      after = [last.orthographic_form, last.id];
+      for (const batch of batches(pending, cfg.batchSize)) {
         try {
-          await ai.runBatch(() => processPages(cfg, db, ai, batch,
+          await ai.runBatch(() => processBatch(cfg, db, ai, batch,
             languagePolicy(language, cfg.languagePolicies), target, log));
         } catch (error) {
           if (!(error instanceof BudgetReachedError)) throw error;
@@ -135,6 +101,7 @@ export async function populate(task, cfg, db, ai, { log = console.log, select = 
         }
         if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
       }
+      if (pending.length < windowSize) break;
     }
   }
   log(`Scan complete. Finalized results ${cfg.write ? 'inserted into the database' : 'saved locally'}. Rerun to retry skipped items.`);

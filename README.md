@@ -48,6 +48,10 @@ The project pins Bun 1.4.2 in `.bun-version` and `packageManager`.
 The Turso database must contain the existing SAPO tables: `languages`, `entries`,
 `phonetic_transcriptions`, and `pronunciation_respellings`. The generators use
 `id` primary keys and `created_at` timestamps and do not create or alter tables.
+New databases use `database/schema.sql`. For existing databases, apply
+`database/migrations/001_unique_respelling_target.sql` to enforce one guide per
+IPA/target pair and replace the old nonunique index. Duplicate pairs must be
+resolved first; the migration fails instead of deleting data.
 Connections use HTTPS and reject HTTP redirects. The generators read the database
 by default and insert results only with `--write`.
 
@@ -108,14 +112,14 @@ these scripts, independent of the working directory.
 
 - `stateDir`: local results directory, default `scripts/generators/.state/`.
 - `batchSize`: 1–1000 usable words per processing batch and maximum items per AI
-  request, default 20. Generation, reviews, and saves/inserts finish before the
-  next processing batch starts. Multiple IPA variants or long inputs/review
+  request or database insertion transaction, default 20. Generation, reviews,
+  and saves/inserts finish before the next processing batch starts. Multiple IPA variants or long inputs/review
   notes can require several AI requests for one processing batch.
 - `batchSizeMultiplicity`: multiplies `batchSize` to set each retrieval window's
   usable-word count. Omit for 1; explicit values must be integers greater than 1.
-  Bounded database scans collect that many usable words or reach the end of the
-  source language. The window is processed before the next window is read.
-  IPA-ID refresh queries do not count. For example, `batchSize: 20` with
+  SQL filters out completed entries before applying this window's `LIMIT`.
+  The window is processed before the next window is read. IPA lookup queries
+  do not count toward the limit. For example, `batchSize: 20` with
   `batchSizeMultiplicity: 3` retrieves up to 60 usable words at a time and
   processes them in batches of 20.
 - `ai`: provider, model, API, reasoning effort, output cap, and token prices.
@@ -154,8 +158,9 @@ again for those results. It creates or updates no local state. Without a saved
 pair, a write run chooses its source and target in memory.
 
 After each AI batch, required reviews finish before finalized values are inserted.
-Database insert transactions contain at most 50 records. An insertion failure stops
-further AI generation; previous inserted batches remain in the database. Any uninserted
+Database insert transactions contain at most `batchSize` records (maximum 1000).
+An insertion failure stops further AI generation; previous inserted batches
+remain in the database. Any uninserted
 in-memory results are lost when the process exits and may need generating again.
 Repeating the command discovers progress by scanning existing database values and
 local results. There is no separate cache-only insertion mode.
@@ -168,11 +173,14 @@ Existing transcriptions and pronunciation variants are preserved.
 Respellings choose a populated source and a distinct target language. They process
 every source IPA variant missing its target guide. Missing IPA is generated first;
 write mode inserts it and reloads real database IDs before linking respellings.
-Turso scans entries in `(orthographic_form, id)` order using keyset pagination.
-Completed words are filtered after scanning, so IPA insertion does not move page
-boundaries. IPA-ID refresh queries include completed words to preserve the scan
-cursors. Insert batches validate entry/pronunciation identity and native-script
-values, commit atomically, and skip results already present in the database.
+Turso retrieves only entries needing work, in `(orthographic_form, id)` order,
+with `LIMIT batchSize × batchSizeMultiplicity`. The limit counts words before
+their IPA variants are loaded. An in-memory spelling/ID marker advances to the
+next window even in local mode or when invalid results were skipped; it resets
+on restart. There are no fixed-size scan pages or page-boundary refreshes.
+After missing IPA is inserted, only the entries that needed it are reloaded by
+ID and checked for changes. Insert batches validate entry/pronunciation identity
+and native-script values, commit atomically, and skip results already present.
 Local mode uses the generated IPA directly, without requiring a database ID.
 
 Requests contain ordered words with positional indexes; database IDs stay local.

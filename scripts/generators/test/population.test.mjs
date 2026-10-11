@@ -85,24 +85,30 @@ function fakeFetch(counter, transform) {
   };
 }
 
-function fakeDatabase(entries, pageSize = 50) {
-  const calls = { pages: 0, ipa: 0, respell: 0 };
+function fakeDatabase(entries) {
+  const calls = { reads: 0, refreshes: 0, ipa: 0, respell: 0 };
   let next = 1;
+  const hydrate = (entry, targetLanguageId) => ({ ...structuredClone(entry),
+    transcriptions: entry.transcriptions.map((ipa) => ({ ...ipa,
+      hasRespelling: (ipa.targets ?? []).includes(languages.find((l) => l.id === targetLanguageId)?.language_code) })),
+  });
+  const compare = (a, b) => a.orthographic_form < b.orthographic_form ? -1 :
+    a.orthographic_form > b.orthographic_form ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   const db = {
     calls, entries,
     languages: async () => languages.map((language) => ({ ...language,
       hasEntries: entries.some((entry) => entry.language_code === language.language_code) })),
-    page: async ({ languageCode, cursor, targetLanguageCode, numItems, includeCompleted }) => {
-      calls.pages++;
-      const all = entries.filter((e) => e.language_code === languageCode);
-      const offset = Number(cursor ?? 0);
-      const page = all.slice(offset, offset + Math.min(pageSize, numItems)).map((entry) => ({ ...structuredClone(entry),
-        transcriptions: entry.transcriptions.map((ipa) => ({ ...ipa,
-          hasRespelling: (ipa.targets ?? []).includes(targetLanguageCode) })),
-      }));
-      const usable = includeCompleted ? page : page.filter((entry) => entry.transcriptions.length === 0 ||
-        (targetLanguageCode && entry.transcriptions.some((t) => !t.hasRespelling)));
-      return { page: usable, continueCursor: String(offset + page.length), isDone: offset + page.length >= all.length };
+    pendingEntries: async ({ languageId, after, targetLanguageId, limit }) => {
+      calls.reads++;
+      return entries.filter((e) => e.language_id === languageId &&
+        (!after || compare(e, { orthographic_form: after[0], id: after[1] }) > 0))
+        .sort(compare).map((e) => hydrate(e, targetLanguageId))
+        .filter((e) => !e.transcriptions.length || (targetLanguageId && e.transcriptions.some((t) => !t.hasRespelling)))
+        .slice(0, limit);
+    },
+    refreshEntries: async (selected, targetLanguageId) => {
+      calls.refreshes++;
+      return selected.map((entry) => hydrate(entries.find((e) => e.id === entry.id), targetLanguageId));
     },
     insertTranscriptions: async (rows) => {
       calls.ipa++;
@@ -588,15 +594,15 @@ test('review output must be definitive, correctly aligned and valid before any d
   }
 });
 
-test('1000-word batches span database pages for both scripts while mutation sizes remain bounded', async () => {
+test('1000-word batches use one full retrieval window and writes follow the configured batch size', async () => {
   for (const task of ['transcriptions', 'respellings']) {
     const cfg = fixture({ write: true, batchSize: 1000, batchSizeMultiplicity: 2, budget: 100e9, rpm: 1000, tpm: 1e9 });
     const db = fakeDatabase(Array.from({ length: 1001 }, (_, i) => entry(String(i))));
-    const page = db.page;
+    const read = db.pendingEntries;
     const mutations = [db.insertTranscriptions, db.insertRespellings];
-    db.page = async (args) => { assert.ok(args.numItems <= 50); return page(args); };
+    db.pendingEntries = async (args) => { assert.equal(args.limit, 2000); return read(args); };
     [db.insertTranscriptions, db.insertRespellings] = mutations.map((insert) => async (rows) => {
-      assert.ok(rows.length <= 50);
+      assert.ok(rows.length <= cfg.batchSize);
       return insert(rows);
     });
     const batches = [];
@@ -897,14 +903,14 @@ test('both scripts keep retrieving single batches by default in local and write 
       const cfg = fixture({ write, batchSize: 2, rpm: 1000, tpm: 1e9 });
       const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
       const requests = [];
-      const page = db.page;
-      db.page = async (args) => { requests.push(args); return page(args); };
+      const read = db.pendingEntries;
+      db.pendingEntries = async (args) => { requests.push(args); return read(args); };
       const logs = [];
       const count = { calls: 0 };
       await populate(task, cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
         { log: (message) => logs.push(message), select: () => 0 });
       assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
-      assert.deepEqual(requests.filter((args) => !args.includeCompleted).map((args) => args.numItems), [2, 2, 2]);
+      assert.deepEqual(requests.map((args) => args.limit), [2, 2, 2]);
       assert.match(logs.at(-1), /Scan complete/);
       if (write) {
         assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
@@ -939,18 +945,18 @@ test('changing retrieval multiplicity reuses cached results in local and write m
   }
 });
 
-test('completed words and empty scan pages do not reduce the multiplied retrieval window', async () => {
+test('completed words are filtered before limiting the retrieval window', async () => {
   for (const task of ['transcriptions', 'respellings']) {
     const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2, rpm: 1000, tpm: 1e9 });
     const complete = (id) => entry(id, 'en', [{ id: `ipa-${id}`, transcription: '/a/', targets: ['es'] }]);
     const db = fakeDatabase([complete('0'), complete('1'), entry('2'), complete('3'),
-      entry('4'), complete('5'), entry('6'), entry('7'), entry('8')], 1);
+      entry('4'), complete('5'), entry('6'), entry('7'), entry('8')]);
     const batches = [];
     const scanRequests = [];
-    const page = db.page;
-    db.page = async (args) => {
-      if (!args.includeCompleted) scanRequests.push(args.numItems);
-      return page(args);
+    const read = db.pendingEntries;
+    db.pendingEntries = async (args) => {
+      scanRequests.push(args.limit);
+      return read(args);
     };
     const count = { calls: 0 };
     const fetcher = fakeFetch(count);
@@ -962,7 +968,25 @@ test('completed words and empty scan pages do not reduce the multiplied retrieva
     assert.deepEqual(batches, task === 'transcriptions' ? [['word-2', 'word-4'], ['word-6', 'word-7'], ['word-8']] :
       [['word-2', 'word-4'], ['word-2', 'word-4'], ['word-6', 'word-7'], ['word-6', 'word-7'], ['word-8'], ['word-8']]);
     assert.equal(db.entries.at(-1).transcriptions.length, 1);
-    assert.deepEqual(scanRequests, [4, 4, 4, 3, 3, 2, 2, 1, 4]);
+    assert.deepEqual(scanRequests, [4, 4]);
+  }
+});
+
+test('invalid words do not trap subsequent windows and are retried on restart in both modes', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write, batchSize: 2, rpm: 1000, tpm: 1e9 });
+    const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
+    const count = { calls: 0 };
+    const firstAI = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) =>
+      answer(rows.map((r) => r.word === 'word-0' ? { ...r, value: 'invalid' } : r))) });
+    await populate('transcriptions', cfg, db, firstAI, { log: () => {} });
+    assert.equal(count.calls, 3);
+    if (write) assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [0, 1, 1, 1, 1]);
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 4);
+    await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count) }), { log: () => {} });
+    assert.equal(count.calls, 4);
+    if (write) assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 5);
   }
 });
 
@@ -972,8 +996,8 @@ test('a retrieval window is processed in batches before the next window is read 
     const db = fakeDatabase([entry('1'), entry('2'), entry('3'), entry('4'), entry('5')].map((e, i) => task === 'respellings' ?
       { ...e, transcriptions: [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] } : e));
     const events = [];
-    const page = db.page;
-    db.page = async (args) => { events.push(`read:${args.numItems}`); return page(args); };
+    const read = db.pendingEntries;
+    db.pendingEntries = async (args) => { events.push(`read:${args.limit}`); return read(args); };
     const field = task === 'transcriptions' ? 'insertTranscriptions' : 'insertRespellings';
     const insert = db[field];
     db[field] = async (rows) => { events.push(`insert:${rows.length}`); return insert(rows); };
@@ -995,16 +1019,16 @@ test('multiplicity 3 repeatedly retrieves 300 usable words and processes batches
     const db = fakeDatabase(Array.from({ length: 701 }, (_, i) => entry(String(i), 'en', task === 'respellings' ?
       [{ id: `ipa-${i}`, transcription: '/a/', targets: [] }] : [])));
     const events = [];
-    const page = db.page;
-    db.page = async (args) => { events.push(`read:${args.numItems}`); return page(args); };
+    const read = db.pendingEntries;
+    db.pendingEntries = async (args) => { events.push(`read:${args.limit}`); return read(args); };
     const fetcher = fakeFetch({ calls: 0 });
     const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
       events.push(`generate:${JSON.parse(JSON.parse(options.body).input[1].content).words.length}`);
       return fetcher(url, options);
     } });
     await populate(task, cfg, db, ai, { log: () => {}, select: () => 0 });
-    const fullWindow = [...Array(6).fill('read:50'), ...Array(3).fill('generate:100')];
-    assert.deepEqual(events, [...fullWindow, ...fullWindow, ...Array(3).fill('read:50'), 'generate:100', 'generate:1']);
+    const fullWindow = ['read:300', ...Array(3).fill('generate:100')];
+    assert.deepEqual(events, [...fullWindow, ...fullWindow, 'read:300', 'generate:100', 'generate:1']);
     assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
     if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
   }
@@ -1062,8 +1086,8 @@ test('budget stops finish the active batch including missing IPA and reviews and
         const cfg = fixture({ write, budget, batchSize: 2, batchSizeMultiplicity: 3, rpm: 1000, tpm: 1e9 });
         const db = fakeDatabase(Array.from({ length: 7 }, (_, i) => entry(String(i))));
         const reads = [];
-        const page = db.page;
-        db.page = async (args) => { reads.push(args); return page(args); };
+        const read = db.pendingEntries;
+        db.pendingEntries = async (args) => { reads.push(args); return read(args); };
         const count = { calls: 0 };
         const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
           count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
@@ -1071,7 +1095,7 @@ test('budget stops finish the active batch including missing IPA and reviews and
         await populate(task, cfg, db, ai, { log: (message) => logs.push(message), select: () => 0 });
         assert.equal(count.calls, callsPerBatch);
         assert.equal(ai.totals().committed, callsPerBatch * 7150000);
-        assert.deepEqual(reads.filter((args) => !args.includeCompleted).map((args) => args.numItems), [6]);
+        assert.deepEqual(reads.map((args) => args.limit), [6]);
         assert.match(logs.at(-1), /^Budget reached:/);
         if (write) {
           assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [1, 1, 0, 0, 0, 0, 0]);
@@ -1124,7 +1148,7 @@ test('input splitting finishes the whole processing batch after exceeding the bu
   });
   await populate('transcriptions', cfg, db, ai, { log: () => {} });
   assert.ok(requests.length > 1);
-  assert.deepEqual(requests.flat().map((job) => job.word), db.entries.slice(0, 200).map((e) => e.orthographic_form));
+  assert.deepEqual(requests.flat().map((job) => job.word), db.entries.map((e) => e.orthographic_form).sort().slice(0, 200));
   assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 200);
   assert.ok(ai.totals().committed > cfg.budget);
 });
@@ -1151,32 +1175,28 @@ test('invalid saved language pairs stop before generation or insertion', async (
     await assert.rejects(populate('respellings', cfg, db,
       createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {}, select: () => 0 }), /Saved language pair/);
     assert.equal(count.calls, 0);
-    assert.deepEqual(db.calls, { pages: 0, ipa: 0, respell: 0 });
+    assert.deepEqual(db.calls, { reads: 0, refreshes: 0, ipa: 0, respell: 0 });
   }
 });
 
-test('a stalled database cursor stops the scan before any AI request', async () => {
+test('an empty missing-word query finishes without any AI request', async () => {
   const cfg = fixture({ write: true });
-  const db = fakeDatabase([entry('1')]);
-  db.page = async () => ({ page: [], continueCursor: null, isDone: false });
+  const db = fakeDatabase([entry('1', 'en', [{ id: 'existing', transcription: '/a/', targets: ['es'] }])]);
   const count = { calls: 0 };
-  await assert.rejects(populate('transcriptions', cfg, db,
-    createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} }), /Pagination did not advance/);
+  await populate('transcriptions', cfg, db,
+    createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {} });
   assert.equal(count.calls, 0);
+  assert.equal(db.calls.reads, 1);
   assert.equal(db.calls.ipa, 0);
 });
 
-test('changed IPA refresh boundaries stop respellings without linking a stale page', async () => {
+test('a failed IPA refresh stops respellings before generating guides', async () => {
   const cfg = fixture({ write: true });
   const db = fakeDatabase([entry('1')]);
-  const page = db.page;
-  db.page = async (args) => {
-    const result = await page(args);
-    return args.includeCompleted ? { ...result, continueCursor: 'changed' } : result;
-  };
+  db.refreshEntries = async () => { throw new Error('Entry changed before IPA refresh'); };
   const count = { calls: 0 };
   await assert.rejects(populate('respellings', cfg, db,
-    createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {}, select: () => 0 }), /Entries changed during this page/);
+    createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {}, select: () => 0 }), /Entry changed before IPA refresh/);
   assert.equal(count.calls, 1);
   assert.equal(db.calls.ipa, 1);
   assert.equal(db.calls.respell, 0);

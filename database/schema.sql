@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS entries_by_language_and_orth
     ON entries(language_id, orthographic_form, id);
 CREATE INDEX IF NOT EXISTS phonetic_transcriptions_by_entry
     ON phonetic_transcriptions(entry_id);
-CREATE INDEX IF NOT EXISTS pronunciation_respellings_by_phonetic_transcription_and_target
+CREATE UNIQUE INDEX IF NOT EXISTS pronunciation_respellings_unique_target
     ON pronunciation_respellings(phonetic_transcription_id, target_language_id);
 CREATE INDEX IF NOT EXISTS pronunciation_respellings_by_source_and_target
     ON pronunciation_respellings(source_language_id, target_language_id, created_at, id);
