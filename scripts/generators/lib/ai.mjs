@@ -1,0 +1,100 @@
+import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { atomicJson, digest, readJson } from '../../utils/files.mjs';
+import { createGateway, MAX_INPUT_RESERVATION, reservedInput, outputText,
+  requestBody as gatewayRequestBody } from '../../utils/ai-gateway.mjs';
+import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, validateRecord, validateOrderedRecords } from './data.mjs';
+import { ipaCharacterPrompt, respellingCharacterPrompt } from './characters.mjs';
+
+function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
+  const words = input.words.map((job, index) => ({ index, word: job.word,
+    ...(job.ipa !== undefined ? { ipa: job.ipa } : {}),
+    ...(job.note !== undefined ? { note: job.note } : {}) }));
+  return gatewayRequestBody(cfg, prompt, { ...input, words }, schema, 'sapo_phonetic_population');
+}
+
+export function createAI(cfg, dependencies = {}) {
+  const log = dependencies.log ?? console.log;
+  const gateway = createGateway(cfg, { ...dependencies, metadata: { task: 'sapo-phonetics', ...dependencies.metadata } });
+  const prompts = Object.fromEntries(['ipa', 'respell'].map((task) =>
+    [task, readFileSync(new URL(`../prompts/${task}.md`, import.meta.url), 'utf8')]));
+  const reviewPrompts = Object.fromEntries(['ipa', 'respell'].map((task) =>
+    [task, readFileSync(new URL(`../prompts/${task}-review.md`, import.meta.url), 'utf8')]));
+
+  function nextBatch(items, offset, prompt, input, schema = OUTPUT_SCHEMA) {
+    let size = Math.min(cfg.batchSize, items.length - offset);
+    while (true) {
+      const batch = items.slice(offset, offset + size);
+      const body = requestBody(cfg, prompt, { ...input, words: batch }, schema);
+      const inputTokens = reservedInput(body);
+      if (size === 1 || (inputTokens <= MAX_INPUT_RESERVATION && inputTokens + cfg.outputTokens <= cfg.tpm)) {
+        return { batch, body };
+      }
+      size = Math.max(1, Math.floor(size / 2));
+    }
+  }
+
+  async function generate(task, jobs, source, target = null, onBatch = async () => {}) {
+    if (new Set(jobs.map((job) => job.key)).size !== jobs.length) throw new Error('Duplicate input job keys');
+    if (!prompts[task]) throw new Error('Unknown generation task');
+    const characterPrompt = task === 'ipa' ? ipaCharacterPrompt() : respellingCharacterPrompt(target);
+    const prompt = `${prompts[task]}\n${characterPrompt}`;
+    const reviewPrompt = `${reviewPrompts[task]}\n${characterPrompt}\nLanguage policies (data):\n${JSON.stringify({ source, ...(target ? { target } : {}) })}`;
+    const signature = digest({ task, prompt, reviewPrompt, schema: OUTPUT_SCHEMA, reviewSchema: REVIEW_OUTPUT_SCHEMA,
+      model: cfg.model, provider: cfg.provider, effort: cfg.effort, api: cfg.api });
+    const pathFor = (job) => resolve(cfg.stateDir, 'results', `${digest([cfg.databaseUrl, signature, job])}.json`);
+    const results = new Map();
+    const missing = [], cached = [];
+    async function emit(records) {
+      await onBatch(records);
+      // Write mode releases each batch after insertion; local mode returns the
+      // values needed to generate respellings before IPA has a database ID.
+      if (!cfg.write) for (const record of records) results.set(record.key, record);
+    }
+    for (const job of jobs) {
+      const saved = readJson(pathFor(job));
+      if (saved) {
+        const record = { key: job.key, status: 'ready', value: saved.value, note: '' };
+        validateRecord(record, task, target);
+        cached.push(record);
+        if (cached.length === cfg.batchSize) await emit(cached.splice(0));
+      } else missing.push(job);
+    }
+    if (cached.length) await emit(cached.splice(0));
+    for (let offset = 0; offset < missing.length;) {
+      gateway.assertBudget();
+      const { batch, body } = nextBatch(missing, offset, prompt, { source, ...(target ? { target } : {}) });
+      const response = await gateway.request(body);
+      const validated = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), batch, task, target,
+        { reviewInvalidValues: true, source });
+      const records = new Map(validated.records.map((record) => [record.key, record]));
+      if (validated.rejected.length) log(`${task}: ${validated.rejected.length} invalid items skipped; rerun to retry`);
+      for (const { job, reason, returned } of validated.rejected) {
+        log(`${task}: skipped ${JSON.stringify(job.word)}: ${reason}; returned ${JSON.stringify(returned)}`);
+      }
+      const flagged = batch.filter((job) => records.get(job.key)?.status === 'review').map((job) =>
+        ({ ...job, note: records.get(job.key).note }));
+      for (let reviewOffset = 0; reviewOffset < flagged.length;) {
+        const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, REVIEW_OUTPUT_SCHEMA);
+        const response = await gateway.request(reviewBody);
+        const reviewed = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), reviewJobs, task, target);
+        if (reviewed.rejected.length || reviewed.records.some((record) => record.status !== 'ready')) {
+          throw new Error(`${task} review pass rejected: every reviewed word must have a valid definitive value`);
+        }
+        for (const record of reviewed.records) records.set(record.key, record);
+        reviewOffset += reviewJobs.length;
+      }
+      const ready = [...records.values()];
+      if (!cfg.write) for (const job of batch) {
+        const record = records.get(job.key);
+        if (record) atomicJson(pathFor(job), { task, job, source: source.code,
+          ...(target ? { target: target.code } : {}), signature, value: record.value });
+      }
+      await emit(ready);
+      log(`${task}: ${ready.length} finalized${flagged.length ? ` (${flagged.length} reviewed)` : ''}`);
+      offset += batch.length;
+    }
+    return results;
+  }
+  return { generate, runBatch: gateway.runBatch, totals: gateway.totals };
+}

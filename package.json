@@ -1,0 +1,17 @@
+{
+  "name": "sapo-phonetic-population",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "engines": {
+    "bun": ">=1.4.2"
+  },
+  "scripts": {
+    "transcriptions": "bun --env-file=.env.local ./scripts/generators/populate-transcriptions.mjs",
+    "respellings": "bun --env-file=.env.local ./scripts/generators/populate-respellings.mjs",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
+  }
+}

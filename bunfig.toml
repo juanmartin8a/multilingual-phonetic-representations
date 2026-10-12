@@ -1,0 +1,3 @@
+# Require explicit --env-file selection.
+# Never automatically load .env.production when NODE_ENV=production.
+env = false

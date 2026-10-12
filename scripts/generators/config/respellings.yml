@@ -1,0 +1,45 @@
+# Settings for populate-respellings.mjs only. CLI options override these values.
+# Monetary values are quoted to preserve exact decimal amounts.
+# Usable words per processing batch and maximum items per AI call: 1-1000.
+batchSize: 20
+# Paths in YAML are relative to this file. The default state directory is
+# <script-dir>/.state; only finalized results and the respelling pair are saved.
+# stateDir: ../.state
+# Retrieve batchSize × multiplicity usable words, process in batchSize batches, and repeat.
+# batchSizeMultiplicity: 2  # Omit for 1; explicit values must be integers greater than 1.
+
+ai:
+  # OpenAI calls use AI Gateway's provider-native endpoint and stored provider key.
+  provider: openai
+  model: gpt-6.1-sol
+  api: responses
+  reasoningEffort: high
+  maxOutputTokens: 25000
+  # Standard, non-regional GPT-6.1 Sol prices, USD/million tokens (2026-10-08).
+  # Change model and all four prices together; use your actual OpenAI rates.
+  pricesUsdPerMillion:
+    input: "2"
+    cachedInput: "0.1"
+    cacheWrite: "2.5"
+    output: "10"
+
+limits:
+  maxUsd: "1"  # Per-run stop threshold; finish the active batch/reviews.
+  requestsPerMinute: 10
+  tokensPerMinute: 200000
+  maxAttempts: 3
+  timeoutMs: 300000
+
+# Non-secret account identifiers required for generation.
+# cloudflare:
+#   accountId: YOUR_32_HEX_ACCOUNT_ID
+#   gatewayId: YOUR_GATEWAY_ID
+
+# Source dialect and target native-script overrides for respelling generation.
+# Also used when generating missing source IPA.
+# Script is a JavaScript Unicode script name, or "Japanese".
+languagePolicies: {}
+# languagePolicies:
+#   es:
+#     dialect: neutral Latin American Spanish
+#     script: Latin

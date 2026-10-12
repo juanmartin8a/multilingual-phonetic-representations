@@ -1,0 +1,42 @@
+# Settings for populate-transcriptions.mjs only. CLI options override these values.
+# Monetary values are quoted to preserve exact decimal amounts.
+# Usable words per processing batch and maximum items per AI call: 1-1000.
+batchSize: 100
+# Paths in YAML are relative to this file. The default state directory is
+# <script-dir>/.state; only finalized results and the respelling pair are saved.
+# stateDir: ../.state
+# Retrieve batchSize × multiplicity usable words, process in batchSize batches, and repeat.
+# batchSizeMultiplicity: 2  # Omit for 1; explicit values must be integers greater than 1.
+
+ai:
+  # OpenAI calls use AI Gateway's provider-native endpoint and stored provider key.
+  provider: openai
+  model: gpt-6-luna
+  api: responses
+  reasoningEffort: medium
+  maxOutputTokens: 25000
+  # Prices for the configured model, USD/million tokens.
+  # Change model and all four prices together; use your actual OpenAI rates.
+  pricesUsdPerMillion:
+    input: "0.1"
+    cachedInput: "0.01"
+    cacheWrite: "0.125"
+    output: "0.5"
+
+limits:
+  maxUsd: "10"  # Per-run stop threshold; finish the active batch/reviews.
+  requestsPerMinute: 20
+  tokensPerMinute: 200000
+  maxAttempts: 3
+  timeoutMs: 300000
+
+# Non-secret account identifiers required for generation.
+cloudflare:
+  accountId: ac4a8f3ceea9446a81ac572e3cffbe94
+  gatewayId: sapo-mpr
+
+# Optional source-language dialect overrides for IPA generation.
+languagePolicies: {}
+# languagePolicies:
+#   es:
+#     dialect: neutral Latin American Spanish
