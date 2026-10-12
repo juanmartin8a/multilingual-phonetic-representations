@@ -1,4 +1,5 @@
 import { digest } from '../../utils/files.mjs';
+import { isIpaCharacter, hasIpaSegment, respellingCharacters } from './characters.mjs';
 
 const DIALECTS = {
   en: 'General American English', es: 'neutral Latin American Spanish',
@@ -60,7 +61,7 @@ export const REVIEW_OUTPUT_SCHEMA = {
   } } },
 };
 
-export function validateOrderedRecords(output, jobs, task, target) {
+export function validateOrderedRecords(output, jobs, task, target, { reviewInvalidValues = false, source } = {}) {
   if (!output || Array.isArray(output) || Object.keys(output).join() !== 'records' || !Array.isArray(output.records)) {
     throw new Error('Invalid structured output');
   }
@@ -72,8 +73,17 @@ export function validateOrderedRecords(output, jobs, task, target) {
     else if (!row || Array.isArray(row) || Object.keys(row).sort().join() !== 'index,note,status,value,word') reason = 'Malformed record';
     else if (row.index !== index) reason = 'Index does not match input position';
     else if (row.word !== job.word) reason = 'Word does not exactly match input word';
-    const record = row && { key: job.key, status: row.status, value: row.value, note: row.note };
+    let record = row && { key: job.key, status: row.status, value: row.value, note: row.note };
     if (!reason) {
+      // Only correctly aligned records can enter review. The definitive review
+      // pass and database validation remain strict: repair is first-pass only.
+      if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
+          typeof record.note === 'string' && record.note.length <= 500 &&
+          !(record.status === 'review' && record.value === null) &&
+          !(task === 'ipa' ? validIpa(record.value) : validRespelling(record.value, target))) {
+        record = { key: job.key, status: 'review', value: null,
+          note: invalidValueNote(record, task, task === 'ipa' ? source : target) };
+      }
       try { validateRecord(record, task, target); }
       catch (error) { reason = error.message; }
     }
@@ -86,16 +96,40 @@ export function validateOrderedRecords(output, jobs, task, target) {
 export function validIpa(value) {
   if (typeof value !== 'string' || value.length > 512 || !/^\/[^/\r\n]+\/$/u.test(value)) return false;
   const body = value.slice(1, -1);
-  return /[\p{L}]/u.test(body) && /^[\p{Script=Latin}\p{Script=Greek}\p{M} .ˈˌːˑ˥˦˧˨˩ꜛꜜʰʲʷˠˤⁿˡʱʼʔʕ͜͡]+$/u.test(body);
+  return hasIpaSegment(body) && [...body].every(isIpaCharacter) && attachedMarks(body);
 }
 
 export function validRespelling(value, policy) {
   if (typeof value !== 'string' || !value.trim() || value !== value.trim() || value.length > 512 ||
       /[\p{Cc}\p{Cf}\u0250-\u02af/\[\]<>]/u.test(value)) return false;
-  if (!policy.script) throw new Error(`No script policy for target ${policy.code}; configure languagePolicies in YAML`);
-  const scripts = policy.script === 'Japanese' ? ['Hiragana', 'Katakana', 'Han'] : [policy.script];
-  const letters = new RegExp(`^[${scripts.map((s) => `\\p{Script_Extensions=${s}}`).join('')}\\p{M} '\u2019\u2010\u2011\u30fc-]+$`, 'u');
-  return /\p{L}/u.test(value) && letters.test(value);
+  const { allowed } = respellingCharacters(policy);
+  return /\p{L}/u.test(value) && [...value.normalize('NFD')].every((c) => allowed.test(c)) && attachedMarks(value);
+}
+
+function attachedMarks(value) {
+  let attached = false;
+  for (const c of value.normalize('NFD')) {
+    if (/\p{M}/u.test(c)) { if (!attached) return false; }
+    else attached = /\p{L}/u.test(c);
+  }
+  return true;
+}
+
+function invalidValueNote(record, task, policy) {
+  const label = task === 'ipa' ? `IPA in source language ${policy?.code ?? 'unknown'}` : `target language ${policy.code}`;
+  const value = record.value;
+  const body = task === 'ipa' && typeof value === 'string' && value.startsWith('/') && value.endsWith('/') ?
+    value.slice(1, -1) : value;
+  const allowed = task === 'respell' ? respellingCharacters(policy).allowed : null;
+  const forbidden = typeof body === 'string' ? [...new Set([...body].filter((c) => task === 'ipa' ?
+    !isIpaCharacter(c) : /[\p{Cc}\p{Cf}\u0250-\u02af/\[\]<>]/u.test(c) ||
+      ![...c.normalize('NFD')].every((part) => allowed.test(part))))] : [];
+  const characters = forbidden.slice(0, 8).map((c) => `${JSON.stringify(c)} (U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')})`).join(', ');
+  const reason = forbidden.length ? `Output includes characters not allowed for ${label}: ${characters}.` :
+    `Invalid ${task} value for ${label}; correct the format, length, missing letters, or unattached marks.`;
+  // Include the rejected candidate as data so the editor can diagnose its error;
+  // the original word and source IPA remain authoritative.
+  return `${reason} Returned value: ${JSON.stringify(value)}.${record.note ? ` Earlier note: ${record.note}` : ''}`.slice(0, 500);
 }
 
 export function validateRecord(row, task, target) {

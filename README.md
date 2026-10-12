@@ -184,9 +184,19 @@ and native-script values, commit atomically, and skip results already present.
 Local mode uses the generated IPA directly, without requiring a database ID.
 
 Requests contain ordered words with positional indexes; database IDs stay local.
-Returned indexes and words must match exactly. Values are validated for IPA shape
-or target script. Invalid individual records are skipped and reported in the
-terminal; rerunning retries them naturally because they were not saved/inserted.
+Returned indexes and words must match exactly. Both IPA prompts receive a shared
+character inventory from the IPA Association's chart and symbol identifiers.
+Both respelling prompts receive only the selected target's character inventory:
+native alphabets for English, Spanish, French, German, Portuguese, Russian, and
+Arabic; configured Unicode script inventories for other languages, with large
+inventories such as Han encoded as compact ranges. The same inventories validate
+generated values and database inserts. Canonically equivalent Unicode spellings
+are accepted without changing the copied input word.
+Correctly aligned first-pass records with invalid pronunciation values become
+review records with null values and diagnostic notes naming disallowed characters
+and their language, or explaining invalid formatting. They receive the final-editor
+pass before saving/insertion. Structural mismatches are skipped and reported in
+the terminal; rerunning retries them because they were not saved/inserted.
 Invalid JSON, refusals, incomplete responses, and billing errors stop the batch.
 
 Valid first-pass items marked for review receive a separate final-editor request

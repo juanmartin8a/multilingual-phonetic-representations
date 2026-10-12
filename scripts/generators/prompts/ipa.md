@@ -24,6 +24,10 @@ of the specific obstacle. Include plausible readings or the suspected correction
 when known, without asserting uncertain claims as facts; at most 500 characters.
 For ready, set status to "ready", value to one IPA transcription in /slashes/
 (at most 512 characters), and note to "". Do not combine alternative readings.
+Check the allowed IPA character inventory supplied below before returning ready.
+If a candidate includes characters outside that inventory or violates the value
+format, correct it; if you cannot, return review with null and describe the
+disallowed characters or formatting problem in note.
 
 ## Output contract
 Return only the JSON object required by the supplied schema. Return one record

@@ -972,13 +972,13 @@ test('completed words are filtered before limiting the retrieval window', async 
   }
 });
 
-test('invalid words do not trap subsequent windows and are retried on restart in both modes', async () => {
+test('mismatched words do not trap subsequent windows and are retried on restart in both modes', async () => {
   for (const write of [false, true]) {
     const cfg = fixture({ write, batchSize: 2, rpm: 1000, tpm: 1e9 });
     const db = fakeDatabase(Array.from({ length: 5 }, (_, i) => entry(String(i))));
     const count = { calls: 0 };
     const firstAI = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) =>
-      answer(rows.map((r) => r.word === 'word-0' ? { ...r, value: 'invalid' } : r))) });
+      answer(rows.map((r) => r.word === 'word-0' ? { ...r, word: 'mismatch' } : r))) });
     await populate('transcriptions', cfg, db, firstAI, { log: () => {} });
     assert.equal(count.calls, 3);
     if (write) assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [0, 1, 1, 1, 1]);

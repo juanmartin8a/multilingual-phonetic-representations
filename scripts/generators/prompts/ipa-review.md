@@ -20,6 +20,9 @@ citation tones with IPA tone letters, including neutral tone where appropriate;
 Japanese segmental IPA without invented pitch accent; and Modern Standard Arabic
 citation forms without invented case endings. Follow source.dialect for other
 Arabic varieties. Avoid narrow allophonic detail and invented precision.
+Follow the allowed IPA character inventory supplied below. When note reports
+disallowed characters or an invalid format in an earlier value, produce a fresh
+valid IPA transcription; do not copy romanization or merely strip characters.
 
 ## Output contract
 Return only the JSON object required by the supplied schema, one record per

@@ -29,6 +29,10 @@ obstacle and relevant sound or mapping (at most 500 characters).
 Otherwise set status to "ready", value to one concise target-script guide
 (at most 512 characters), and note to "". The guide contains no IPA, phonetic
 labels, alternatives, surrounding quotes, or explanations.
+Follow the target-specific allowed character inventory supplied below. Check
+every character before returning ready. Correct disallowed characters or an
+invalid value format; if you cannot, return review with null and describe the
+characters not allowed for the target language or the formatting problem in note.
 
 ## Output contract
 Return only the JSON object required by the supplied schema, one record per

@@ -4,6 +4,7 @@ import { atomicJson, digest, readJson } from '../../utils/files.mjs';
 import { createGateway, MAX_INPUT_RESERVATION, reservedInput, outputText,
   requestBody as gatewayRequestBody } from '../../utils/ai-gateway.mjs';
 import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, validateRecord, validateOrderedRecords } from './data.mjs';
+import { ipaCharacterPrompt, respellingCharacterPrompt } from './characters.mjs';
 
 function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
   const words = input.words.map((job, index) => ({ index, word: job.word,
@@ -35,9 +36,10 @@ export function createAI(cfg, dependencies = {}) {
 
   async function generate(task, jobs, source, target = null, onBatch = async () => {}) {
     if (new Set(jobs.map((job) => job.key)).size !== jobs.length) throw new Error('Duplicate input job keys');
-    const prompt = prompts[task];
-    if (!prompt) throw new Error('Unknown generation task');
-    const reviewPrompt = `${reviewPrompts[task]}\nLanguage policies (data):\n${JSON.stringify({ source, ...(target ? { target } : {}) })}`;
+    if (!prompts[task]) throw new Error('Unknown generation task');
+    const characterPrompt = task === 'ipa' ? ipaCharacterPrompt() : respellingCharacterPrompt(target);
+    const prompt = `${prompts[task]}\n${characterPrompt}`;
+    const reviewPrompt = `${reviewPrompts[task]}\n${characterPrompt}\nLanguage policies (data):\n${JSON.stringify({ source, ...(target ? { target } : {}) })}`;
     const signature = digest({ task, prompt, reviewPrompt, schema: OUTPUT_SCHEMA, reviewSchema: REVIEW_OUTPUT_SCHEMA,
       model: cfg.model, provider: cfg.provider, effort: cfg.effort, api: cfg.api });
     const pathFor = (job) => resolve(cfg.stateDir, 'results', `${digest([cfg.databaseUrl, signature, job])}.json`);
@@ -63,7 +65,8 @@ export function createAI(cfg, dependencies = {}) {
       gateway.assertBudget();
       const { batch, body } = nextBatch(missing, offset, prompt, { source, ...(target ? { target } : {}) });
       const response = await gateway.request(body);
-      const validated = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), batch, task, target);
+      const validated = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), batch, task, target,
+        { reviewInvalidValues: true, source });
       const records = new Map(validated.records.map((record) => [record.key, record]));
       if (validated.rejected.length) log(`${task}: ${validated.rejected.length} invalid items skipped; rerun to retry`);
       for (const { job, reason, returned } of validated.rejected) {

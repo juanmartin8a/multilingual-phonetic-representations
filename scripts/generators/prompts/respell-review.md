@@ -23,6 +23,9 @@ character variety, favoring segmental similarity over incidental tones; Russian
 Cyrillic with acute stress when useful; Arabic letters with vowel marks. Other
 targets use their configured native script and standard reading conventions.
 Do not translate, use IPA in the guide, or introduce phonetic labels.
+Follow the target-specific allowed character inventory supplied below. When note
+reports disallowed characters or an invalid format in an earlier value, rewrite
+the guide with allowed target characters while preserving the supplied IPA.
 
 ## Output contract
 Return only the JSON object required by the supplied schema, one record per
