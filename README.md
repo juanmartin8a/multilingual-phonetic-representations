@@ -122,3 +122,33 @@ reached, the current batch and its required reviews finish before processing
 stops, so final spending can exceed that threshold. Shared database, file, and
 AI request helpers are documented in
 [`scripts/utils/README.md`](scripts/utils/README.md).
+
+## Licensing
+
+The software in this repository, including the population scripts and SQL
+schema, is licensed under [Apache License 2.0](LICENSE).
+
+The Multilingual Phonetic Representations database is licensed under
+[Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+This includes its language records, word entries, frequencies, IPA
+transcriptions, and pronunciation respellings, together with MPR's rights in
+the database compilation. The full data license is in [LICENSE-DATA](LICENSE-DATA).
+Upstream material retains its original license and attribution notices.
+The database is provided as-is, without warranties, subject to section 5 of
+the data license.
+
+When distributing database copies or exports, include the
+[database attribution](ATTRIBUTION.md) and the data license or a link to it.
+Identify any changes made to the data.
+
+## Data sources and attribution
+
+The words and frequencies used for database entries come from
+[wordfreq](https://github.com/rspeer/wordfreq) by **Robyn Speer**.
+Copyright 2022 Robyn Speer. The wordfreq data is licensed under
+[Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+
+Multilingual Phonetic Representations uses that data as the starting vocabulary
+and adds IPA transcriptions and pronunciation respellings. See
+[ATTRIBUTION.md](ATTRIBUTION.md) for the upstream credits, SUBTLEX authors,
+license references, and provenance details.
