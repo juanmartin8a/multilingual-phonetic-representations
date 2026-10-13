@@ -122,3 +122,15 @@ reached, the current batch and its required reviews finish before processing
 stops, so final spending can exceed that threshold. Shared database, file, and
 AI request helpers are documented in
 [`scripts/utils/README.md`](scripts/utils/README.md).
+
+## Data sources and attribution
+
+The words and frequencies used for database entries come from
+[wordfreq](https://github.com/rspeer/wordfreq) by **Robyn Speer**.
+Copyright 2022 Robyn Speer. The wordfreq data is licensed under
+[Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+
+Multilingual Phonetic Representations uses that data as the starting vocabulary
+and adds IPA transcriptions and pronunciation respellings. See
+[ATTRIBUTION.md](ATTRIBUTION.md) for the upstream credits, SUBTLEX authors,
+license references, and provenance details.
