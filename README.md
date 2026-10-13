@@ -48,10 +48,12 @@ The project pins Bun 1.4.2 in `.bun-version` and `packageManager`.
 The Turso database must contain the existing SAPO tables: `languages`, `entries`,
 `phonetic_transcriptions`, and `pronunciation_respellings`. The generators use
 `id` primary keys and `created_at` timestamps and do not create or alter tables.
-New databases use `database/schema.sql`. For existing databases, apply
-`database/migrations/001_unique_respelling_target.sql` to enforce one guide per
-IPA/target pair and replace the old nonunique index. Duplicate pairs must be
-resolved first; the migration fails instead of deleting data.
+New databases use `database/schema.sql`. Existing databases need the
+`pronunciation_respellings_unique_target` index defined there to enforce one
+guide per IPA/target pair. After creating it, the old
+`pronunciation_respellings_by_phonetic_transcription_and_target` index can be
+dropped. Duplicate pairs must be resolved first; index creation fails instead
+of deleting data. No separate migration file is required.
 Connections use HTTPS and reject HTTP redirects. The generators read the database
 by default and insert results only with `--write`.
 

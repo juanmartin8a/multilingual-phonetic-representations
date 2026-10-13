@@ -108,14 +108,17 @@ test('the schema prevents duplicate guides and the existing-database migration p
   await client.execute(`CREATE INDEX pronunciation_respellings_by_phonetic_transcription_and_target
     ON pronunciation_respellings(phonetic_transcription_id, target_language_id)`);
   await client.execute(duplicate);
-  const migration = readFileSync(new URL('../../../database/migrations/001_unique_respelling_target.sql', import.meta.url), 'utf8');
-  await assert.rejects(client.executeMultiple(migration), /UNIQUE/);
+  const schema = readFileSync(new URL('../../../database/schema.sql', import.meta.url), 'utf8');
+  const uniqueIndex = schema.match(/CREATE UNIQUE INDEX IF NOT EXISTS pronunciation_respellings_unique_target\s+ON pronunciation_respellings\(phonetic_transcription_id, target_language_id\);/)[0];
+  const migrate = () => client.batch([uniqueIndex,
+    'DROP INDEX IF EXISTS pronunciation_respellings_by_phonetic_transcription_and_target'], 'write');
+  await assert.rejects(migrate(), /UNIQUE/);
   assert.equal(await count(client, 'pronunciation_respellings'), 2);
   assert.ok((await client.execute("PRAGMA index_list('pronunciation_respellings')")).rows
     .some((index) => index.name === 'pronunciation_respellings_by_phonetic_transcription_and_target'));
   await client.execute("DELETE FROM pronunciation_respellings WHERE id = 'duplicate'");
-  await client.executeMultiple(migration);
-  await client.executeMultiple(migration); // Safe to apply again.
+  await migrate();
+  await migrate(); // Safe to apply again.
   assert.equal(await count(client, 'pronunciation_respellings'), 1);
   await assert.rejects(client.execute(duplicate), /UNIQUE/);
   const indexes = (await client.execute("PRAGMA index_list('pronunciation_respellings')")).rows;
