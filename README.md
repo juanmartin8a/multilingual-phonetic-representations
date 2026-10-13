@@ -5,7 +5,7 @@ its schema and the tools used to populate and manage its data. The database
 connects words across languages with their IPA pronunciations and readable
 pronunciation guides.
 
-Browse the database's live content on [sapo.surf](https://sapo.surf/mulyilingual-phonetic-representations).
+Browse the database's live content on [sapo.surf](https://sapo.surf/multilingual-phonetic-representations).
 
 ## How it works
 
