@@ -1,5 +1,14 @@
 # Data attribution
 
+The Multilingual Phonetic Representations (MPR) database is licensed under
+[Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
+See the [README licensing section](README.md#licensing) for the scope and
+[LICENSE-DATA](LICENSE-DATA) for the full license text.
+
+When sharing the database, credit
+[Multilingual Phonetic Representations](https://sapo.surf/multilingual-phonetic-representations)
+and retain the upstream credits below.
+
 ## wordfreq
 
 The words and frequencies used for entries in the Multilingual Phonetic
@@ -20,10 +29,6 @@ and adds IPA transcriptions and pronunciation respellings through its own
 population tools. Those added phonetic representations are not supplied by
 wordfreq. The exact imported wordfreq release and import parameters have not
 yet been recorded in this repository.
-
-This notice identifies the source and existing license of the imported
-material. It does not assign a new license to MPR's software or phonetic
-representations, or establish the licensing scope of the combined database.
 
 The wordfreq software has a separate
 [Apache License 2.0 notice](https://github.com/rspeer/wordfreq/blob/912caf64b657478d1dff1138efdc078947d54bb1/LICENSE.txt);
