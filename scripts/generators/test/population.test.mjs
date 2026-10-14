@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { configuration } from '../lib/config.mjs';
 import { usd } from '../../utils/numbers.mjs';
 import { readJson } from '../../utils/files.mjs';
-import { validIpa, validRespelling, validateRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA } from '../lib/data.mjs';
+import { validIpa, validRespelling, validateRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA, RESPELL_REVIEW_OUTPUT_SCHEMA, validateRespellingRecord } from '../lib/data.mjs';
 import { createAI } from '../lib/ai.mjs';
 import { BudgetReachedError, usageCost, reservation, outputText, retryDelay } from '../../utils/ai-gateway.mjs';
 import { populate } from '../lib/run.mjs';
@@ -63,6 +63,13 @@ function answer(records, extra = {}) {
 const row = (key, value = '/həˈloʊ/') => ({ key, status: 'ready', value, note: '' });
 const modelRow = (job, value = '/həˈloʊ/') => ({ index: job.index, word: job.word, status: 'ready', value, note: '' });
 
+const modelRespellingRow = (job, respelling = 'jelóu') => ({ index: job.index, word: job.word,
+  transcription: job.transcription ?? '/həˈloʊ/', transcriptionStatus: 'ready',
+  respelling, respellingStatus: 'ready', note: '' });
+const flagReview = (record, note) => Object.hasOwn(record, 'respelling') ?
+  { ...record, respellingStatus: 'review', respelling: null, note } :
+  { ...record, status: 'review', value: null, note };
+
 function fakeFetch(counter, transform) {
   return async (url, options) => {
     counter.calls++;
@@ -80,7 +87,7 @@ function fakeFetch(counter, transform) {
     const input = JSON.parse(body.input[1].content);
     const policy = input.target ?? (input.words.some((job) => job.note !== undefined) &&
       JSON.parse(body.input[0].content[0].text.split('Language policies (data):\n')[1]).target);
-    const records = input.words.map((job) => policy ? modelRow(job, 'jelóu') : modelRow(job));
+    const records = input.words.map((job) => policy ? modelRespellingRow(job) : modelRow(job));
     return new Response(JSON.stringify(transform ? transform(records) : answer(records)), { status: 200 });
   };
 }
@@ -450,15 +457,15 @@ test('stored-key failures and redirects never fall back or persist echoed creden
 test('both APIs generate ordered words without exposing database keys or hashes', async () => {
   for (const api of ['responses', 'chat']) {
     const cfg = fixture({ api });
-    const jobs = [{ key: 'opaque-id-1', word: 'hello', ipa: '/a/' }, { key: 'opaque-id-2', word: 'hello', ipa: '/b/' }];
+    const jobs = [{ key: 'opaque-id-1', word: 'hello', transcription: '/a/' }, { key: 'opaque-id-2', word: 'hello', transcription: '/b/' }];
     let calls = 0;
     const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
       calls++;
       const body = JSON.parse(options.body);
       const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
-      assert.deepEqual(input.words, [{ index: 0, word: 'hello', ipa: '/a/' }, { index: 1, word: 'hello', ipa: '/b/' }]);
+      assert.deepEqual(input.words, [{ index: 0, word: 'hello', transcription: '/a/' }, { index: 1, word: 'hello', transcription: '/b/' }]);
       assert.equal(JSON.stringify(body).includes('opaque-id'), false);
-      const records = input.words.map((job) => modelRow(job, 'jelóu'));
+      const records = input.words.map((job) => modelRespellingRow(job));
       if (api === 'responses') return Response.json(answer(records));
       return Response.json({ usage: { prompt_tokens: 2000, completion_tokens: 500,
         prompt_tokens_details: { cached_tokens: 1000, cache_write_tokens: 100 } },
@@ -466,7 +473,7 @@ test('both APIs generate ordered words without exposing database keys or hashes'
     } });
     const results = await ai.generate('respell', jobs, source, target);
     assert.equal(calls, 1);
-    assert.deepEqual([...results].map(([key, record]) => [key, record.value]), jobs.map((job) => [job.key, 'jelóu']));
+    assert.deepEqual([...results].map(([key, record]) => [key, record.respelling]), jobs.map((job) => [job.key, 'jelóu']));
   }
 });
 
@@ -483,9 +490,9 @@ test('ordered validation rejects shifts, spelling normalization and invalid valu
     assert.equal(result.records.length, 0);
     assert.equal(result.rejected.length, 2);
   }
-  const repeated = [{ key: 'a', word: 'read', ipa: '/riːd/' }, { key: 'b', word: 'read', ipa: '/rɛd/' }];
-  const result = validateOrderedRecords({ records: repeated.map((j, index) => modelRow({ ...j, index }, index ? 'red' : 'rid')) }, repeated, 'respell', target);
-  assert.deepEqual(result.records.map((r) => [r.key, r.value]), [['a', 'rid'], ['b', 'red']]);
+  const repeated = [{ key: 'a', word: 'read', transcription: '/riːd/' }, { key: 'b', word: 'read', transcription: '/rɛd/' }];
+  const result = validateOrderedRecords({ records: repeated.map((j, index) => modelRespellingRow({ ...j, index }, index ? 'red' : 'rid')) }, repeated, 'respell', target);
+  assert.deepEqual(result.records.map((r) => [r.key, r.respelling]), [['a', 'rid'], ['b', 'red']]);
 });
 
 test('missing usage stops before result caching', async () => {
@@ -517,12 +524,12 @@ test('both scripts finalize reviews before writing and skip inserted results on 
     const db = fakeDatabase([entry('1'), entry('2')]);
     const count = { calls: 0 };
     const ai = createAI(cfg, { fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) => count.calls % 2 ?
-      { ...r, status: 'review', value: null, note: 'Ambiguous without context' } : r))), log: () => {} });
+      flagReview(r, 'Ambiguous without context') : r))), log: () => {} });
     await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
     assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
     if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
     const before = count.calls;
-    assert.equal(before, task === 'respellings' ? 8 : 4);
+    assert.equal(before, 4);
     const resumed = createAI(cfg, { fetchFn: () => { throw new Error('Unexpected repeat generation'); }, log: () => {} });
     await populate(task, cfg, db, resumed, { select: () => 0, log: () => {} });
     assert.equal(count.calls, before);
@@ -535,14 +542,14 @@ test('both APIs review only flagged words and notes with the same model and a di
       const cfg = fixture({ api });
       const requests = [];
       const jobs = [{ key: 'local-1', word: 'read' }, { key: 'local-2', word: 'hello' }, { key: 'local-3', word: 'read' }]
-        .map((job, index) => ({ ...job, ...(task === 'respell' ? { ipa: index ? '/rɛd/' : '/riːd/' } : {}) }));
+        .map((job, index) => ({ ...job, ...(task === 'respell' ? { transcription: index ? '/rɛd/' : '/riːd/' } : {}) }));
       const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
         const body = JSON.parse(options.body);
         requests.push(body);
         const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
         const records = input.words.map((job, index) => requests.length === 1 && index !== 1 ?
-          { index, word: job.word, status: 'review', value: null, note: `Resolve variant ${index}` } :
-          modelRow(job, task === 'ipa' ? '/riːd/' : 'rid'));
+          flagReview(task === 'ipa' ? modelRow(job) : modelRespellingRow(job, 'rid'), `Resolve variant ${index}`) :
+          task === 'ipa' ? modelRow(job, '/riːd/') : modelRespellingRow(job, 'rid'));
         return new Response(JSON.stringify(api === 'responses' ? answer(records) : {
           id: 'chat-answer', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
           usage: { prompt_tokens: 2000, completion_tokens: 500, prompt_tokens_details: { cached_tokens: 1000, cache_write_tokens: 100 } },
@@ -555,26 +562,30 @@ test('both APIs review only flagged words and notes with the same model and a di
       const prompt = (body) => api === 'responses' ? body.input[0].content[0].text : body.messages[0].content;
       assert.notEqual(prompt(first), prompt(second));
       assert.equal(api === 'responses' ? second.input.length : second.messages.length, 2);
-      assert.deepEqual(api === 'responses' ? second.text.format.schema : second.response_format.json_schema.schema, REVIEW_OUTPUT_SCHEMA);
+      assert.deepEqual(api === 'responses' ? second.text.format.schema : second.response_format.json_schema.schema,
+        task === 'ipa' ? REVIEW_OUTPUT_SCHEMA : RESPELL_REVIEW_OUTPUT_SCHEMA);
       const input = JSON.parse(api === 'responses' ? second.input[1].content : second.messages[1].content);
       assert.deepEqual(Object.keys(input), ['words']);
       assert.deepEqual(input.words, [0, 2].map((original, index) => ({ index, word: 'read',
-        ...(task === 'respell' ? { ipa: jobs[original].ipa } : {}), note: `Resolve variant ${original}` })));
+        ...(task === 'respell' ? { transcription: jobs[original].transcription } : {}), note: `Resolve variant ${original}`,
+        ...(task === 'respell' ? { candidate: { transcription: jobs[original].transcription,
+          transcriptionStatus: 'ready', respelling: null, respellingStatus: 'review' } } : {}) })));
       assert.equal(JSON.stringify(second).includes('hello'), false);
       assert.equal(JSON.stringify(second).includes('local-'), false);
       assert.equal(result.size, 3);
-      assert.ok([...result.values()].every((record) => record.status === 'ready'));
+      assert.ok([...result.values()].every((record) => task === 'ipa' ? record.status === 'ready' :
+        record.transcriptionStatus === 'ready' && record.respellingStatus === 'ready'));
       assert.equal(ai.totals().known, 2 * 7150000);
       const saved = readdirSync(join(cfg.stateDir, 'results')).map((file) => readJson(join(cfg.stateDir, 'results', file)));
       assert.equal(saved.length, 3);
-      assert.ok(saved.every((item) => typeof item.value === 'string' && !Object.hasOwn(item, 'firstPassRecord')));
+      assert.ok(saved.every((item) => typeof (task === 'ipa' ? item.value : item.respelling) === 'string' && !Object.hasOwn(item, 'firstPassRecord')));
     }
   }
 });
 
 test('review output must be definitive, correctly aligned and valid before any database write', async () => {
   const invalid = [
-    (r) => ({ ...r, status: 'review', value: null, note: 'Still unsure' }),
+    (r) => (flagReview(r, 'Still unsure')),
     (r) => ({ ...r, value: null }),
     (r) => ({ ...r, value: 'not IPA' }),
     (r) => ({ ...r, word: 'wrong' }),
@@ -586,7 +597,7 @@ test('review output must be definitive, correctly aligned and valid before any d
     const db = fakeDatabase([entry('1')]);
     const count = { calls: 0 };
     const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
-      count.calls === 1 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : transform(r)))) });
+      count.calls === 1 ? flagReview(r, 'Ambiguous') : transform(r)))) });
     await assert.rejects(populate('transcriptions', cfg, db, ai, { log: () => {} }), /review pass rejected/);
     assert.equal(db.calls.ipa, 0);
     assert.deepEqual(readdirSync(cfg.stateDir), []);
@@ -613,7 +624,7 @@ test('1000-word batches use one full retrieval window and writes follow the conf
       return fetcher(url, options);
     } });
     await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
-    assert.deepEqual(batches, task === 'transcriptions' ? [1000, 1] : [1000, 1000, 1, 1]);
+    assert.deepEqual(batches, [1000, 1]);
     assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
     if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
   }
@@ -692,22 +703,22 @@ test('default mode saves only finalized values and the minimal respelling pair',
     const db = fakeDatabase([entry('1')]);
     const count = { calls: 0 };
     const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) =>
-      answer(rows.map((r) => count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+      answer(rows.map((r) => count.calls % 2 ? flagReview(r, 'Ambiguous') : r))) });
     await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
     assert.equal(db.calls.ipa, 0);
     assert.equal(db.calls.respell, 0);
     assert.deepEqual(readdirSync(cfg.stateDir).sort(), task === 'transcriptions' ? ['results'] : ['respelling-pair.json', 'results']);
     const files = readdirSync(join(cfg.stateDir, 'results'));
-    assert.equal(files.length, task === 'transcriptions' ? 1 : 2);
+    assert.equal(files.length, 1);
     for (const file of files) {
       const item = readJson(join(cfg.stateDir, 'results', file));
       assert.deepEqual(Object.keys(item).sort(), item.task === 'ipa' ?
-        ['job', 'signature', 'source', 'task', 'value'] : ['job', 'signature', 'source', 'target', 'task', 'value']);
+        ['job', 'signature', 'source', 'task', 'value'] : ['job', 'respelling', 'signature', 'source', 'target', 'task', 'transcription']);
       assert.equal(item.source, 'en');
       assert.equal(item.signature.length, 64);
       assert.equal(item.job.key.length > 0, true);
       assert.equal(item.job.word, 'word-1');
-      assert.ok(typeof item.value === 'string');
+      assert.ok(typeof (item.task === 'ipa' ? item.value : item.respelling) === 'string');
     }
     if (task === 'respellings') assert.deepEqual(readJson(join(cfg.stateDir, 'respelling-pair.json')), { source: 'en', target: 'es' });
     assertNoCredentials(cfg);
@@ -741,7 +752,7 @@ test('write mode reads existing local results and pair without modifying any fil
   const count = { calls: 0 };
   const options = { select: () => 0, log: () => {} };
   await populate('respellings', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), options);
-  assert.equal(count.calls, 2);
+  assert.equal(count.calls, 1);
   const before = snapshot(cfg.stateDir);
   const writing = { ...cfg, write: true };
   const ai = createAI(writing, { log: () => {}, fetchFn: () => { throw new Error('No paid regeneration'); } });
@@ -762,7 +773,7 @@ test('each AI batch is reviewed and inserted before the next generation batch fo
     db[field] = async (rows) => { events.push('insert'); return insert(rows); };
     const count = { calls: 0 };
     const fetcher = fakeFetch(count, (rows) => answer(rows.map((r) => count.calls % 2 ?
-      { ...r, status: 'review', value: null, note: 'Two readings' } : r)));
+      flagReview(r, 'Two readings') : r)));
     const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
       const input = JSON.parse(JSON.parse(options.body).input[1].content);
       events.push(input.words[0].note ? 'review' : 'generate');
@@ -860,7 +871,7 @@ test('cache signatures distinguish database, model settings, policies, and exact
     return fetcher(url, { ...options, body: JSON.stringify(body) });
   } }).generate('ipa', jobs, source);
   for (const ipa of ['/a/', '/b/']) {
-    await createAI(cfg, options).generate('respell', [{ key: '1', word: 'hello', ipa }], source, target);
+    await createAI(cfg, options).generate('respell', [{ key: '1', word: 'hello', transcription: ipa }], source, target);
   }
   assert.equal(count.calls, 6);
 });
@@ -887,7 +898,7 @@ test('failed review saves no intermediate result and the next run starts generat
     const count = { calls: 0 };
     const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => {
       if (count.calls === 2) throw new TypeError('network');
-      return answer(rows.map((r) => ({ ...r, status: 'review', value: null, note: 'Ambiguous' })));
+      return answer(rows.map((r) => (flagReview(r, 'Ambiguous'))));
     }) });
     await assert.rejects(populate('transcriptions', cfg, db, ai, { log: () => {} }), /transport failed/);
     assert.deepEqual(readdirSync(cfg.stateDir), []);
@@ -909,7 +920,7 @@ test('both scripts keep retrieving single batches by default in local and write 
       const count = { calls: 0 };
       await populate(task, cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
         { log: (message) => logs.push(message), select: () => 0 });
-      assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
+      assert.equal(count.calls, 3);
       assert.deepEqual(requests.map((args) => args.limit), [2, 2, 2]);
       assert.match(logs.at(-1), /Scan complete/);
       if (write) {
@@ -917,7 +928,7 @@ test('both scripts keep retrieving single batches by default in local and write 
         if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
         assert.deepEqual(readdirSync(cfg.stateDir), []);
       } else {
-        assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 5 : 10);
+        assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 5);
         assert.ok(db.entries.every((e) => e.transcriptions.length === 0));
       }
     }
@@ -934,11 +945,11 @@ test('changing retrieval multiplicity reuses cached results in local and write m
     await run(cfg);
     const multiplied = { ...cfg, batchSizeMultiplicity: 2 };
     await run(multiplied);
-    assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
-    assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 5 : 10);
+    assert.equal(count.calls, 3);
+    assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 5);
     const before = snapshot(cfg.stateDir);
     await run({ ...multiplied, write: true });
-    assert.equal(count.calls, task === 'transcriptions' ? 3 : 6);
+    assert.equal(count.calls, 3);
     assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
     if (task === 'respellings') assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
     assert.deepEqual(snapshot(cfg.stateDir), before);
@@ -965,8 +976,7 @@ test('completed words are filtered before limiting the retrieval window', async 
       return fetcher(url, options);
     } });
     await populate(task, cfg, db, ai, { log: () => {}, select: () => 0 });
-    assert.deepEqual(batches, task === 'transcriptions' ? [['word-2', 'word-4'], ['word-6', 'word-7'], ['word-8']] :
-      [['word-2', 'word-4'], ['word-2', 'word-4'], ['word-6', 'word-7'], ['word-6', 'word-7'], ['word-8'], ['word-8']]);
+    assert.deepEqual(batches, [['word-2', 'word-4'], ['word-6', 'word-7'], ['word-8']]);
     assert.equal(db.entries.at(-1).transcriptions.length, 1);
     assert.deepEqual(scanRequests, [4, 4]);
   }
@@ -1053,7 +1063,7 @@ test('retrieval continues across source languages and multiple variants share on
     requests.push(JSON.parse(JSON.parse(options.body).input[1].content).words.length);
     return fetcher(url, options);
   } }), { log: () => {}, select: () => 0 });
-  assert.deepEqual(requests, [1, 1, 1, 1, 1]);
+  assert.deepEqual(requests, [1, 1, 1, 1]);
   assert.ok(variants.entries[0].transcriptions.every((ipa) => ipa.targets.includes('es')));
   assert.equal(variants.entries[1].transcriptions.length, 1);
 });
@@ -1069,7 +1079,7 @@ test('duplicate pronunciation documents share one result and get separate databa
   const fetcher = fakeFetch(count);
   const ai = createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
     const input = JSON.parse(JSON.parse(options.body).input[1].content);
-    assert.deepEqual(input.words.map((job) => job.ipa), ['/a/', '/b/']);
+    assert.deepEqual(input.words.map((job) => job.transcription), ['/a/', '/b/']);
     return fetcher(url, options);
   } });
   await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
@@ -1080,7 +1090,7 @@ test('duplicate pronunciation documents share one result and get separate databa
 
 test('budget stops finish the active batch including missing IPA and reviews and leave prefetched batches untouched', async () => {
   for (const task of ['transcriptions', 'respellings']) {
-    const callsPerBatch = task === 'transcriptions' ? 2 : 4;
+    const callsPerBatch = 2;
     for (const write of [false, true]) {
       for (const budget of [1, 7150000, callsPerBatch * 7150000]) {
         const cfg = fixture({ write, budget, batchSize: 2, batchSizeMultiplicity: 3, rpm: 1000, tpm: 1e9 });
@@ -1090,7 +1100,7 @@ test('budget stops finish the active batch including missing IPA and reviews and
         db.pendingEntries = async (args) => { reads.push(args); return read(args); };
         const count = { calls: 0 };
         const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
-          count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Ambiguous' } : r))) });
+          count.calls % 2 ? flagReview(r, 'Ambiguous') : r))) });
         const logs = [];
         await populate(task, cfg, db, ai, { log: (message) => logs.push(message), select: () => 0 });
         assert.equal(count.calls, callsPerBatch);
@@ -1102,7 +1112,7 @@ test('budget stops finish the active batch including missing IPA and reviews and
           if (task === 'respellings') assert.ok(db.entries.slice(0, 2).every((e) => e.transcriptions[0].targets.includes('es')));
           assert.deepEqual(readdirSync(cfg.stateDir), []);
         } else {
-          assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, task === 'transcriptions' ? 2 : 4);
+          assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 2);
           assert.ok(db.entries.every((e) => e.transcriptions.length === 0));
         }
         await assert.rejects(ai.runBatch(() => { throw new Error('A new batch must not start'); }), BudgetReachedError);
@@ -1119,14 +1129,14 @@ test('a respelling batch finishes every pronunciation variant and its reviews af
     ...Array.from({ length: 6 }, (_, i) => entry(String(i + 1)))]);
     const count = { calls: 0 };
     const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
-      count.calls % 2 ? { ...r, status: 'review', value: null, note: 'Check pronunciation' } : r))) });
+      count.calls % 2 ? flagReview(r, 'Check pronunciation') : r))) });
     await populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 });
-    assert.equal(count.calls, 6); // IPA and two respelling requests, each with a review.
-    assert.equal(ai.totals().committed, 6 * 7150000);
+    assert.equal(count.calls, 4); // Two combined requests, each with a review.
+    assert.equal(ai.totals().committed, 4 * 7150000);
     if (write) {
       assert.ok(db.entries.slice(0, 2).flatMap((e) => e.transcriptions).every((ipa) => ipa.targets.includes('es')));
       assert.equal(db.entries[1].transcriptions.length, 1);
-    } else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 5);
+    } else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 4);
     assert.ok(db.entries.slice(2).every((e) => e.transcriptions.length === 0));
   }
 });
@@ -1190,7 +1200,7 @@ test('an empty missing-word query finishes without any AI request', async () => 
   assert.equal(db.calls.ipa, 0);
 });
 
-test('a failed IPA refresh stops respellings before generating guides', async () => {
+test('a failed IPA refresh stops insertion after generating the finalized pair', async () => {
   const cfg = fixture({ write: true });
   const db = fakeDatabase([entry('1')]);
   db.refreshEntries = async () => { throw new Error('Entry changed before IPA refresh'); };
@@ -1201,4 +1211,155 @@ test('a failed IPA refresh stops respellings before generating guides', async ()
   assert.equal(db.calls.ipa, 1);
   assert.equal(db.calls.respell, 0);
   assert.deepEqual(readdirSync(cfg.stateDir), []);
+});
+
+test('mixed IPA jobs finalize uncertain pairs and preserve accepted readings in both APIs and modes', async () => {
+  for (const api of ['responses', 'chat']) for (const write of [false, true]) {
+    const cfg = fixture({ api, write });
+    const db = fakeDatabase([entry('1'), entry('2', 'en', [
+      { id: 'present', transcription: '/riːd/', targets: [] },
+      { id: 'past', transcription: '/rɛd/', targets: [] },
+      { id: 'completed', transcription: '/a/', targets: ['es'] },
+    ]), entry('3')]);
+    const requests = [], inserted = [];
+    const insert = db.insertRespellings;
+    db.insertRespellings = async (rows) => { inserted.push(...rows); return insert(rows); };
+    const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
+      const body = JSON.parse(options.body);
+      const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+      requests.push(input);
+      assert.equal(db.calls.ipa, 0, 'Both fields must finish review before any IPA insert');
+      assert.equal(db.calls.respell, 0);
+      const records = input.words.map((j) => {
+        if (requests.length === 1) {
+          if (j.word === 'word-1') return { ...modelRespellingRow(j, 'rid'), transcription: '/riːd/',
+            transcriptionStatus: 'review', note: 'Uncertain reading; verify IPA and guide' };
+          if (j.word === 'word-3') return flagReview({ ...modelRespellingRow(j), transcription: '/a/' }, 'Guide uncertain');
+          if (j.transcription === '/riːd/') return flagReview(modelRespellingRow(j, 'rid'), 'Mapping uncertain');
+          return modelRespellingRow(j, 'red');
+        }
+        if (j.word === 'word-1') return { ...modelRespellingRow(j, 'red'), transcription: '/rɛd/' };
+        return modelRespellingRow(j, j.word === 'word-3' ? 'a' : 'rid');
+      });
+      return Response.json(api === 'responses' ? answer(records) : {
+        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
+        usage: { prompt_tokens: 2000, completion_tokens: 500,
+          prompt_tokens_details: { cached_tokens: 1000, cache_write_tokens: 100 } },
+      });
+    } });
+    await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0].words.map((j) => [j.word, j.transcription]),
+      [['word-1', null], ['word-2', '/riːd/'], ['word-2', '/rɛd/'], ['word-3', null]]);
+    const review = requests[1].words;
+    assert.deepEqual(review.map((j) => [j.word, j.transcription]),
+      [['word-1', null], ['word-2', '/riːd/'], ['word-3', '/a/']]);
+    assert.equal(review[0].candidate.transcription, '/riːd/');
+    assert.equal(review[0].candidate.respelling, 'rid');
+    assert.equal(review[0].candidate.respellingStatus, 'review', 'IPA uncertainty must propagate to the guide');
+    if (write) {
+      assert.deepEqual(inserted.map((r) => [r.orthographic_form, r.transcription, r.respelling]),
+        [['word-1', '/rɛd/', 'red'], ['word-2', '/riːd/', 'rid'], ['word-2', '/rɛd/', 'red'], ['word-3', '/a/', 'a']]);
+      assert.deepEqual(db.entries.filter((e) => e.id !== '2').map((e) => e.transcriptions[0].transcription), ['/rɛd/', '/a/']);
+      assert.deepEqual(readdirSync(cfg.stateDir), []);
+    } else {
+      const saved = readdirSync(join(cfg.stateDir, 'results')).map((f) => readJson(join(cfg.stateDir, 'results', f)));
+      assert.equal(saved.length, 4);
+      assert.equal(saved.find((r) => r.job.word === 'word-1').transcription, '/rɛd/');
+      assert.equal(saved.find((r) => r.job.word === 'word-1').respelling, 'red');
+      assert.ok(saved.every((r) => !Object.hasOwn(r, 'candidate') && !Object.hasOwn(r, 'note')));
+    }
+  }
+});
+
+test('combined validation rejects changed supplied IPA and malformed records without sending them to review', () => {
+  const jobs = [{ key: 'locked', word: 'read', transcription: '/riːd/' },
+    { key: 'new', word: 'é', transcription: null }];
+  const rows = jobs.map((j, index) => modelRespellingRow({ ...j, index }));
+  for (const bad of [
+    { ...rows[0], transcription: '/rɛd/' }, { ...rows[0], transcription: null },
+    { ...rows[0], transcriptionStatus: 'review', note: 'Change reading' },
+    { ...rows[0], respellingStatus: 'unknown' }, { ...rows[0], word: 'wrong' },
+    { ...rows[0], index: 1 }, { ...rows[0], extra: 'ignored?' },
+    { ...rows[0], note: 'x'.repeat(501) }, { ...rows[0], note: 'Unexplained ready note' },
+  ]) {
+    const result = validateOrderedRecords({ records: [bad, rows[1]] }, jobs, 'respell', target,
+      { reviewInvalidValues: true, source });
+    assert.deepEqual(result.records.map((r) => r.key), ['new']);
+    assert.equal(result.rejected.length, 1);
+  }
+  for (const records of [rows.slice(1), [...rows, rows[0]], rows.toReversed(),
+    [rows[0], { ...rows[1], word: 'é' }]]) {
+    const result = validateOrderedRecords({ records }, jobs, 'respell', target);
+    assert.ok(result.rejected.length > 0);
+  }
+  assert.throws(() => validateRespellingRecord({ ...rows[1], transcriptionStatus: 'review',
+    respellingStatus: 'ready', note: 'IPA uncertain' }, jobs[1], target), /Uncertain IPA/);
+});
+
+test('review cannot change existing or accepted newly generated IPA, and failed pairs save neither component', async () => {
+  for (const write of [false, true]) for (const existing of [false, true]) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase([entry('1', 'en', existing ? [{ id: 'old', transcription: '/a/', targets: [] }] : [])]);
+    let calls = 0;
+    const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
+      calls++;
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      const records = input.words.map((j) => calls === 1 ?
+        flagReview({ ...modelRespellingRow(j), transcription: '/a/' }, 'Guide needs review') :
+        { ...modelRespellingRow(j), transcription: '/b/' });
+      return Response.json(answer(records));
+    } });
+    await assert.rejects(populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} }), /review pass rejected/);
+    assert.equal(calls, 2);
+    assert.equal(db.calls.ipa, 0);
+    assert.equal(db.calls.respell, 0);
+    assert.deepEqual(readdirSync(cfg.stateDir), write ? [] : ['respelling-pair.json']);
+  }
+});
+
+test('failed combined review must be definitive, aligned and valid before saving IPA or a guide', async () => {
+  const invalid = [
+    (r) => ({ ...r, transcriptionStatus: 'review', respellingStatus: 'review', note: 'Still uncertain' }),
+    (r) => flagReview(r, 'Still uncertain'),
+    (r) => ({ ...r, transcription: null }), (r) => ({ ...r, respelling: null }),
+    (r) => ({ ...r, transcription: 'not IPA' }), (r) => ({ ...r, respelling: 'həloʊ' }),
+    (r) => ({ ...r, word: 'wrong' }), (r) => ({ ...r, index: 1 }),
+    (r) => ({ ...r, note: 'Explanation' }),
+  ];
+  for (const write of [false, true]) for (const transform of invalid) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase([entry('1')]);
+    let calls = 0;
+    const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
+      calls++;
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      return Response.json(answer(input.words.map((j) => calls === 1 ?
+        { ...modelRespellingRow(j), transcriptionStatus: 'review', respellingStatus: 'review', note: 'Resolve reading' } :
+        transform(modelRespellingRow(j)))));
+    } });
+    await assert.rejects(populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} }), /review pass rejected/);
+    assert.equal(db.calls.ipa, 0);
+    assert.equal(db.calls.respell, 0);
+    assert.deepEqual(readdirSync(cfg.stateDir), write ? [] : ['respelling-pair.json']);
+  }
+});
+
+test('a concurrent different IPA is preserved and never receives a guide generated for another reading', async () => {
+  const cfg = fixture({ write: true });
+  const db = fakeDatabase([entry('1')]);
+  const insert = db.insertTranscriptions;
+  db.insertTranscriptions = async (rows) => insert(rows.map((r) => ({ ...r, transcription: '/b/' })));
+  const count = { calls: 0 }, logs = [];
+  await populate('respellings', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
+    { select: () => 0, log: (s) => logs.push(s) });
+  assert.equal(count.calls, 1);
+  assert.equal(db.entries[0].transcriptions[0].transcription, '/b/');
+  assert.deepEqual(db.entries[0].transcriptions[0].targets, []);
+  assert.equal(db.calls.respell, 0);
+  assert.ok(logs.some((s) => /finalized IPA not found/.test(s)));
+  await populate('respellings', cfg, db, createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }),
+    { select: () => 0, log: () => {} });
+  assert.equal(count.calls, 2);
+  assert.deepEqual(db.entries[0].transcriptions[0].targets, ['es']);
 });
