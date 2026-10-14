@@ -97,22 +97,36 @@ AI Gateway:
 - [`populate-respellings.mjs`](scripts/generators/populate-respellings.mjs)
   adds pronunciation guides for speakers of another language, using that
   language's native writing system. It covers each IPA variant missing a guide
-  for the chosen target language and generates missing IPA first. It reuses a
-  saved source/target language pair when available; otherwise, it randomly
+  for the chosen target language. Each generation record contains IPA and its
+  respelling together: existing IPA is preserved exactly; missing IPA is
+  generated first within the same response, then used to derive the guide. It
+  reuses a saved source/target language pair when available; otherwise, it randomly
   chooses a source language with entries and a different target language.
   Local runs save that choice for later runs.
 
 Both scripts work through missing data in batches. Generated results are
 checked against the input words and the allowed pronunciation characters.
 Items flagged for review receive a separate automated editing pass before
-being finalized. Generation and review prompts live in
+being finalized. Respelling records use `transcription` and `respelling` fields,
+with separate `transcriptionStatus` and `respellingStatus` review decisions.
+The reviewer preserves accepted IPA; when newly generated IPA needs
+review, it finalizes the IPA first and regenerates the guide to match. Both
+fields must be valid and ready before either is saved. Entries with multiple
+IPA readings contribute a separate item for each reading missing a guide.
+Generation and review prompts live in
 [`scripts/generators/prompts/`](scripts/generators/prompts/).
 
 By default, finalized results are saved locally in
 `scripts/generators/.state/`. Database write mode saves results directly to the
 database in transactions, without creating or updating local files. Saved
 results can be reused when they match the current request, and later runs skip
-records already completed in the database.
+records already completed in the database. The combined respelling contract
+uses a new cache signature, so older separate IPA/respelling results are not
+reused by that generator; existing database results are preserved.
+If an import saves IPA but fails before saving its guide, the next run can reuse
+the cached pair when its finalized IPA exactly matches the stored reading.
+Existing IPA that fails the generator's format or character checks is reported
+and skipped so other entries can continue; its stored value is preserved.
 
 Each generator has a YAML file in
 [`scripts/generators/config/`](scripts/generators/config/) that controls the AI

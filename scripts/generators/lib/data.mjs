@@ -61,6 +61,76 @@ export const REVIEW_OUTPUT_SCHEMA = {
   } } },
 };
 
+export const RESPELL_OUTPUT_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['records'],
+  properties: { records: { type: 'array', items: {
+    type: 'object', additionalProperties: false,
+    required: ['index', 'word', 'transcription', 'transcriptionStatus', 'respelling', 'respellingStatus', 'note'],
+    properties: { index: { type: 'integer' }, word: { type: 'string' },
+      transcription: { type: ['string', 'null'] },
+      transcriptionStatus: { type: 'string', enum: ['ready', 'review'] },
+      respelling: { type: ['string', 'null'] },
+      respellingStatus: { type: 'string', enum: ['ready', 'review'] }, note: { type: 'string' } },
+  } } },
+};
+
+export const RESPELL_REVIEW_OUTPUT_SCHEMA = {
+  ...RESPELL_OUTPUT_SCHEMA,
+  properties: { records: { type: 'array', items: {
+    ...RESPELL_OUTPUT_SCHEMA.properties.records.items,
+    properties: { ...RESPELL_OUTPUT_SCHEMA.properties.records.items.properties,
+      transcription: { type: 'string' }, transcriptionStatus: { type: 'string', enum: ['ready'] },
+      respelling: { type: 'string' }, respellingStatus: { type: 'string', enum: ['ready'] },
+      note: { type: 'string', enum: [''] },
+    },
+  } } },
+};
+
+export const needsRespellingReview = (record) =>
+  record.transcriptionStatus === 'review' || record.respellingStatus === 'review';
+
+export function validateRespellingRecord(record, job, target) {
+  if (typeof record.note !== 'string' || record.note.length > 500) throw new Error('Invalid review note');
+  if (job.transcription !== null && (record.transcription !== job.transcription || record.transcriptionStatus !== 'ready')) {
+    throw new Error('Supplied IPA must be preserved exactly and remain ready');
+  }
+  for (const [field, valid] of [['transcription', validIpa], ['respelling', (value) => validRespelling(value, target)]]) {
+    const status = record[`${field}Status`];
+    if (!['ready', 'review'].includes(status)) throw new Error(`Invalid ${field} status`);
+    // Uncertain candidates may be retained for the reviewer, but must be valid
+    // in format. A missing candidate is allowed only for a flagged field.
+    if (!(status === 'review' && record[field] === null) && !valid(record[field])) {
+      throw new Error(`Invalid ${field} value`);
+    }
+  }
+  if (record.transcriptionStatus === 'review' && record.respellingStatus !== 'review') {
+    throw new Error('Uncertain IPA requires respelling review');
+  }
+  if (needsRespellingReview(record) ? !record.note.trim() : record.note !== '') {
+    throw new Error('Review requires a note; ready pairs require an empty note');
+  }
+}
+
+function repairRespellingRecord(record, source, target) {
+  if (typeof record.note !== 'string' || record.note.length > 500 ||
+      ![record.transcriptionStatus, record.respellingStatus].every((status) => ['ready', 'review'].includes(status))) return record;
+  const notes = [];
+  for (const [field, task, policy, valid] of [
+    ['transcription', 'ipa', source, validIpa],
+    ['respelling', 'respell', target, (value) => validRespelling(value, target)],
+  ]) {
+    if (!(record[`${field}Status`] === 'review' && record[field] === null) && !valid(record[field])) {
+      notes.push(invalidValueNote({ value: record[field], note: '' }, task, policy));
+      record = { ...record, [field]: null, [`${field}Status`]: 'review' };
+    }
+  }
+  if (record.transcriptionStatus === 'review' && record.respellingStatus === 'ready') {
+    record = { ...record, respellingStatus: 'review' };
+    notes.push('Reassess the respelling against the finalized IPA.');
+  }
+  return notes.length ? { ...record, note: [...notes, record.note].filter(Boolean).join(' ').slice(0, 500) } : record;
+}
+
 export function validateOrderedRecords(output, jobs, task, target, { reviewInvalidValues = false, source } = {}) {
   if (!output || Array.isArray(output) || Object.keys(output).join() !== 'records' || !Array.isArray(output.records)) {
     throw new Error('Invalid structured output');
@@ -70,22 +140,38 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
     const row = output.records[index];
     let reason;
     if (output.records.length !== jobs.length) reason = 'Incorrect record count; positional alignment cannot be trusted';
-    else if (!row || Array.isArray(row) || Object.keys(row).sort().join() !== 'index,note,status,value,word') reason = 'Malformed record';
+    else if (!row || Array.isArray(row) || Object.keys(row).sort().join() !== (task === 'respell' ?
+      'index,note,respelling,respellingStatus,transcription,transcriptionStatus,word' : 'index,note,status,value,word')) reason = 'Malformed record';
     else if (row.index !== index) reason = 'Index does not match input position';
     else if (row.word !== job.word) reason = 'Word does not exactly match input word';
-    let record = row && { key: job.key, status: row.status, value: row.value, note: row.note };
+    let record = row && (task === 'respell' ? { key: job.key, transcription: row.transcription,
+      transcriptionStatus: row.transcriptionStatus, respelling: row.respelling,
+      respellingStatus: row.respellingStatus, note: row.note } :
+      { key: job.key, status: row.status, value: row.value, note: row.note });
     if (!reason) {
       // Only correctly aligned records can enter review. The definitive review
       // pass and database validation remain strict: repair is first-pass only.
-      if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
-          typeof record.note === 'string' && record.note.length <= 500 &&
-          !(record.status === 'review' && record.value === null) &&
-          !(task === 'ipa' ? validIpa(record.value) : validRespelling(record.value, target))) {
-        record = { key: job.key, status: 'review', value: null,
-          note: invalidValueNote(record, task, task === 'ipa' ? source : target) };
+      if (task === 'respell') {
+        // Check the input lock before repair so a changed or malformed supplied
+        // IPA cannot be treated as a newly generated pronunciation.
+        if (job.transcription !== null && (record.transcription !== job.transcription || record.transcriptionStatus !== 'ready')) {
+          reason = 'Supplied IPA must be preserved exactly and remain ready';
+        } else {
+          if (reviewInvalidValues) record = repairRespellingRecord(record, source, target);
+          try { validateRespellingRecord(record, job, target); }
+          catch (error) { reason = error.message; }
+        }
+      } else {
+        if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
+            typeof record.note === 'string' && record.note.length <= 500 &&
+            !(record.status === 'review' && record.value === null) &&
+            !(task === 'ipa' ? validIpa(record.value) : validRespelling(record.value, target))) {
+          record = { key: job.key, status: 'review', value: null,
+            note: invalidValueNote(record, task, task === 'ipa' ? source : target) };
+        }
+        try { validateRecord(record, task, target); }
+        catch (error) { reason = error.message; }
       }
-      try { validateRecord(record, task, target); }
-      catch (error) { reason = error.message; }
     }
     if (reason) rejected.push({ job, reason, returned: row ?? null });
     else records.push(record);

@@ -1,7 +1,7 @@
 import { test, afterEach } from 'bun:test';
 import assert from 'node:assert/strict';
 import { createClient } from '@libsql/client';
-import { readFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPopulationDatabase } from '../lib/db.mjs';
@@ -193,7 +193,9 @@ test('both generators reuse local results and then insert into real SQL tables w
       const input = JSON.parse(JSON.parse(options.body).input[1].content);
       return Response.json({ status: 'completed', usage: { input_tokens: 100, output_tokens: 100 },
         output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ records:
-          input.words.map((job) => ({ index: job.index, word: job.word, status: 'ready', note: '', value: input.target ? 'a' : '/a/' })) }) }] }] });
+          input.words.map((job) => (input.target ? { index: job.index, word: job.word, note: '',
+            transcription: job.transcription ?? '/a/', transcriptionStatus: 'ready', respelling: 'a', respellingStatus: 'ready' } :
+            { index: job.index, word: job.word, status: 'ready', note: '', value: '/a/' })) }) }] }] });
     } };
     const local = createPopulationDatabase(client);
     await populate(task, cfg, local, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
@@ -225,5 +227,169 @@ test('both generators reuse local results and then insert into real SQL tables w
     assert.equal(await count(client, 'phonetic_transcriptions'), words.length);
     assert.deepEqual(snapshot(), before);
     assert.deepEqual((await client.execute('PRAGMA foreign_key_check')).rows, []);
+  }
+});
+
+test('combined SQL population links corrected IPA and existing variants to their own finalized guides', async () => {
+  const { client, db } = await fixture({ words: ['read', 'read', 'moon'] });
+  await client.batch([
+    { sql: 'INSERT INTO phonetic_transcriptions VALUES (?, ?, ?, ?, ?)', args: ['present', 0, 'e1', 'ipa', '/riːd/'] },
+    { sql: 'INSERT INTO phonetic_transcriptions VALUES (?, ?, ?, ?, ?)', args: ['past', 0, 'e1', 'ipa', '/rɛd/'] },
+    { sql: 'INSERT INTO phonetic_transcriptions VALUES (?, ?, ?, ?, ?)', args: ['complete', 0, 'e2', 'ipa', '/muːn/'] },
+  ], 'write');
+  await db.insertRespellings([respellingRow('complete', 'moon', '/muːn/')]);
+  const stateDir = mkdtempSync(join(tmpdir(), 'sapo-combined-sql-'));
+  directories.push(stateDir);
+  const cfg = { stateDir, write: true, databaseUrl: 'https://test.turso.io', batchSize: 100, batchSizeMultiplicity: 1,
+    provider: 'openai', api: 'responses', model: 'test', builtIn: false, effort: 'omit', outputTokens: 1000,
+    account: 'a'.repeat(32), gateway: 'test', token: 'fake', rpm: 1000, tpm: 1e9, attempts: 1,
+    timeout: 1000, budget: 1e9, prices: { input: 1000, cached: 1000, write: 1000, output: 1000 } };
+  const requests = [];
+  const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
+    const input = JSON.parse(JSON.parse(options.body).input[1].content);
+    requests.push(input);
+    assert.equal(await count(client, 'phonetic_transcriptions'), 3, 'No new IPA before review');
+    assert.equal(await count(client, 'pronunciation_respellings'), 1, 'No new guides before review');
+    return Response.json({ status: 'completed', usage: { input_tokens: 100, output_tokens: 100 },
+      output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ records: input.words.map((j) => {
+        if (requests.length === 1 && j.transcription === null) return {
+          index: j.index, word: j.word, transcription: '/riːd/', transcriptionStatus: 'review',
+          respelling: 'rid', respellingStatus: 'review', note: 'Check reading',
+        };
+        const transcription = j.transcription ?? '/rɛd/';
+        return { index: j.index, word: j.word, transcription, transcriptionStatus: 'ready',
+          respelling: transcription === '/riːd/' ? 'rid' : 'red', respellingStatus: 'ready', note: '' };
+      }) }) }] }] });
+  } });
+  await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[0].words.map((j) => j.transcription), [null, '/rɛd/', '/riːd/']);
+  assert.equal(requests[1].words.length, 1);
+  const links = (await client.execute(`SELECT e.id, p.transcription, r.respelling
+    FROM pronunciation_respellings r JOIN phonetic_transcriptions p ON p.id = r.phonetic_transcription_id
+    JOIN entries e ON e.id = p.entry_id ORDER BY e.id, p.transcription`)).rows;
+  assert.deepEqual(links.map((r) => [r.id, r.transcription, r.respelling]),
+    [['e0', '/rɛd/', 'red'], ['e1', '/riːd/', 'rid'], ['e1', '/rɛd/', 'red'], ['e2', '/muːn/', 'a']]);
+  assert.equal(await count(client, 'phonetic_transcriptions'), 4);
+  assert.deepEqual((await client.execute('PRAGMA foreign_key_check')).rows, []);
+  assert.deepEqual(await db.pendingEntries({ languageId: 'en', targetLanguageId: 'es', limit: 100 }), []);
+  assert.deepEqual(readdirSync(stateDir), []);
+});
+
+function generationConfig(extra = {}) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'sapo-recovery-sql-'));
+  directories.push(stateDir);
+  return { stateDir, databaseUrl: 'https://test.turso.io', batchSize: 100, batchSizeMultiplicity: 1,
+    provider: 'openai', api: 'responses', model: 'test', builtIn: false, effort: 'omit', outputTokens: 1000,
+    account: 'a'.repeat(32), gateway: 'test', token: 'fake', rpm: 1000, tpm: 1e9, attempts: 1,
+    timeout: 1000, budget: 1e9, prices: { input: 1000, cached: 1000, write: 1000, output: 1000 }, ...extra };
+}
+
+function combinedResponse(input) {
+  return Response.json({ status: 'completed', usage: { input_tokens: 100, output_tokens: 100 },
+    output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ records:
+      input.words.map((j) => ({ index: j.index, word: j.word, transcription: j.transcription ?? '/a/',
+        transcriptionStatus: 'ready', respelling: (j.transcription ?? '/a/').slice(1, -1),
+        respellingStatus: 'ready', note: '' })) }) }] }] });
+}
+
+const cacheSnapshot = (cfg) => Object.fromEntries(readdirSync(join(cfg.stateDir, 'results')).map((file) => {
+  const path = join(cfg.stateDir, 'results', file);
+  return [file, { content: readFileSync(path, 'utf8'), modified: statSync(path).mtimeMs }];
+}));
+
+test('incompatible existing IPA is skipped without blocking later SQL windows in either mode', async () => {
+  for (const write of [false, true]) {
+    const { client } = await fixture({ words: ['a', 'b', 'c', 'd'] });
+    await client.batch([
+      "INSERT INTO phonetic_transcriptions VALUES ('legacy', 0, 'e0', 'ipa', '[a]')",
+      "INSERT INTO phonetic_transcriptions VALUES ('valid', 0, 'e1', 'ipa', '/b/')",
+    ], 'write');
+    const cfg = generationConfig({ write, batchSize: 1 });
+    const db = createPopulationDatabase(client, cfg);
+    const requests = [], logs = [];
+    const ai = createAI(cfg, { log: (s) => logs.push(s), fetchFn: async (url, options) => {
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      requests.push(input);
+      return combinedResponse(input);
+    } });
+    await populate('respellings', cfg, db, ai, { select: () => 0, log: (s) => logs.push(s) });
+    assert.deepEqual(requests.flatMap((r) => r.words.map((j) => j.word)), ['b', 'c', 'd']);
+    assert.ok(logs.some((s) => /skipped "a".*incompatible.*correct the stored IPA/.test(s)));
+    assert.equal((await client.execute("SELECT transcription FROM phonetic_transcriptions WHERE id = 'legacy'")).rows[0].transcription, '[a]');
+    assert.equal(await count(client, 'phonetic_transcriptions'), write ? 4 : 2);
+    assert.equal(await count(client, 'pronunciation_respellings'), write ? 3 : 0);
+    if (write) assert.deepEqual(readdirSync(cfg.stateDir), []);
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 3);
+  }
+});
+
+test('partial SQL imports reuse the exact finalized local pair without regeneration or cache writes', async () => {
+  for (const stage of ['refresh', 'respelling']) {
+    const { client } = await fixture({ words: ['a'] });
+    const cfg = generationConfig();
+    let calls = 0;
+    const dependencies = { log: () => {}, fetchFn: async (url, options) => {
+      calls++;
+      return combinedResponse(JSON.parse(JSON.parse(options.body).input[1].content));
+    } };
+    const options = { select: () => 0, log: () => {} };
+    await populate('respellings', cfg, createPopulationDatabase(client), createAI(cfg, dependencies), options);
+    assert.equal(calls, 1);
+    const before = cacheSnapshot(cfg);
+    const writeCfg = { ...cfg, write: true };
+    const db = createPopulationDatabase(client, writeCfg);
+    const method = stage === 'refresh' ? 'refreshEntries' : 'insertRespellings';
+    const original = db[method];
+    db[method] = async () => { throw new Error('injected import failure'); };
+    const cachedOnly = { log: () => {}, fetchFn: () => { throw new Error('Unexpected paid regeneration'); } };
+    await assert.rejects(populate('respellings', writeCfg, db, createAI(writeCfg, cachedOnly), options), /injected import failure/);
+    assert.equal(await count(client, 'phonetic_transcriptions'), 1);
+    assert.equal(await count(client, 'pronunciation_respellings'), 0);
+    db[method] = original;
+    const ai = createAI(writeCfg, cachedOnly);
+    await populate('respellings', writeCfg, db, ai, options);
+    assert.equal(ai.totals().committed, 0);
+    assert.equal(calls, 1);
+    assert.equal(await count(client, 'pronunciation_respellings'), 1);
+    assert.deepEqual(cacheSnapshot(cfg), before);
+    assert.deepEqual((await client.execute('PRAGMA foreign_key_check')).rows, []);
+  }
+});
+
+test('the missing-IPA cache is not reused for a different stored pronunciation or generation policy', async () => {
+  for (const change of ['pronunciation', 'dialect', 'target', 'model']) {
+    const { client, db } = await fixture({ words: ['a'] });
+    const cfg = generationConfig();
+    let calls = 0;
+    const requests = [];
+    const dependencies = { log: () => {}, fetchFn: async (url, options) => {
+      calls++;
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      requests.push(input);
+      return combinedResponse(input);
+    } };
+    const options = { select: () => 0, log: () => {} };
+    await populate('respellings', cfg, createPopulationDatabase(client), createAI(cfg, dependencies), options);
+    await db.insertTranscriptions([ipaRow('e0', 'a', change === 'pronunciation' ? '/b/' : '/a/')]);
+    const writeCfg = { ...cfg, write: true,
+      ...(change === 'dialect' ? { languagePolicies: { en: { dialect: 'British English' } } } : {}),
+      ...(change === 'model' ? { model: 'another-model' } : {}),
+    };
+    if (change === 'target') {
+      // Change the selected pair while keeping the finalized cache files intact.
+      writeFileSync(join(cfg.stateDir, 'respelling-pair.json'), JSON.stringify({ source: 'en', target: 'fr' }));
+    }
+    const before = cacheSnapshot(cfg);
+    const writableDb = createPopulationDatabase(client, writeCfg);
+    await populate('respellings', writeCfg, writableDb, createAI(writeCfg, dependencies), options);
+    assert.equal(calls, 2, `${change} must prevent fallback reuse`);
+    assert.equal(requests[1].words[0].transcription, change === 'pronunciation' ? '/b/' : '/a/');
+    assert.equal(Object.hasOwn(requests[1].words[0], 'cacheFallback'), false);
+    assert.deepEqual(cacheSnapshot(cfg), before);
+    const saved = (await client.execute(`SELECT p.transcription, r.respelling, r.target_language_id
+      FROM pronunciation_respellings r JOIN phonetic_transcriptions p ON p.id = r.phonetic_transcription_id`)).rows;
+    assert.deepEqual(saved.map((r) => [r.transcription, r.respelling, r.target_language_id]),
+      [[change === 'pronunciation' ? '/b/' : '/a/', change === 'pronunciation' ? 'b' : 'a', change === 'target' ? 'fr' : 'es']]);
   }
 });

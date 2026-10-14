@@ -12,6 +12,8 @@ import { populate } from '../lib/run.mjs';
 const policy = (code) => languagePolicy({ language_code: code, name: code });
 const source = policy('ar'), target = policy('es');
 const job = { key: 'private-id', word: 'الاخري' };
+const pairedRow = (j, transcription, respelling, extra = {}) => ({ index: j.index ?? 0, word: j.word,
+  transcription, transcriptionStatus: 'ready', respelling, respellingStatus: 'ready', note: '', ...extra });
 const row = (value, extra = {}) => ({ index: 0, word: job.word, status: 'ready', value, note: '', ...extra });
 const dirs = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -80,12 +82,14 @@ test('invalid first-pass values become review with diagnostic notes, including e
     ['respell', ''], ['ipa', null], ['respell', 'a'.repeat(513)]]) {
     for (const status of ['ready', 'review']) {
       if (status === 'review' && value === null) continue;
-      const original = row(value, { status, note: status === 'review' ? 'Existing uncertainty' : '' });
-      const result = validateOrderedRecords({ records: [original] }, [job], task, target,
+      const inputJob = task === 'ipa' ? job : { ...job, transcription: '/alʔuxraː/' };
+      const original = task === 'ipa' ? row(value, { status, note: status === 'review' ? 'Existing uncertainty' : '' }) :
+        pairedRow(job, inputJob.transcription, value, { respellingStatus: status, note: status === 'review' ? 'Existing uncertainty' : '' });
+      const result = validateOrderedRecords({ records: [original] }, [inputJob], task, target,
         { reviewInvalidValues: true, source });
       assert.equal(result.rejected.length, 0);
-      assert.equal(result.records[0].status, 'review');
-      assert.equal(result.records[0].value, null);
+      assert.equal(result.records[0][task === 'ipa' ? 'status' : 'respellingStatus'], 'review');
+      assert.equal(result.records[0][task === 'ipa' ? 'value' : 'respelling'], null);
       assert.ok(result.records[0].note.length <= 500);
       assert.match(result.records[0].note, task === 'ipa' ? /source language ar/ : /target language es/);
       if (value === '/al-ʔuḫrā/') {
@@ -95,7 +99,7 @@ test('invalid first-pass values become review with diagnostic notes, including e
       }
       if (status === 'review' && value.length < 100) assert.match(result.records[0].note, /Existing uncertainty/);
       // Definitive review cannot repair itself or write an invalid value.
-      assert.equal(validateOrderedRecords({ records: [original] }, [job], task, target).rejected.length, 1);
+      assert.equal(validateOrderedRecords({ records: [original] }, [inputJob], task, target).rejected.length, 1);
     }
   }
   const review = row(null, { status: 'review', note: 'Ambiguous reading' });
@@ -112,7 +116,7 @@ test('both APIs inject only the requested target inventory before words and repa
   for (const api of ['responses', 'chat']) for (const task of ['ipa', 'respell']) {
     const cfg = config({ api });
     const requests = [], emissions = [], logs = [];
-    const jobs = [{ ...job, ...(task === 'respell' ? { ipa: '/alʔuxraː/' } : {}) }, { key: 'other-id', word: 'hello' }];
+    const jobs = [{ ...job, ...(task === 'respell' ? { transcription: '/alʔuxraː/' } : {}) }, { key: 'other-id', word: 'hello', ...(task === 'respell' ? { transcription: null } : {}) }];
     const ai = createAI(cfg, { log: (s) => logs.push(s), fetchFn: async (url, options) => {
       const body = JSON.parse(options.body);
       requests.push(body);
@@ -127,7 +131,7 @@ test('both APIs inject only the requested target inventory before words and repa
         assert.equal(injected.code, 'es');
         assert.ok(injected.characters.includes('ñ'));
         for (const unrelated of ['ã', 'œ', 'ß', 'а', 'ه', 'ハ']) assert.equal(injected.characters.includes(unrelated), false);
-        assert.equal(prompt.includes('Allowed IPA characters'), false);
+        assert.equal(prompt.includes('Allowed IPA characters'), true);
       }
       assert.equal(JSON.stringify(body).includes('private-id'), false);
       const review = input.words[0].note !== undefined;
@@ -135,12 +139,12 @@ test('both APIs inject only the requested target inventory before words and repa
         assert.equal(input.words.length, 1, 'Only the invalid candidate enters review');
         assert.equal(input.words[0].word, job.word);
         assert.match(input.words[0].note, /characters not allowed/);
-        if (task === 'respell') assert.equal(input.words[0].ipa, '/alʔuxraː/');
+        if (task === 'respell') assert.equal(input.words[0].transcription, '/alʔuxraː/');
         assert.deepEqual(emissions, [], 'Nothing emits before review completes');
       }
-      return response(input.words.map((j) => ({ index: j.index, word: j.word, status: 'ready', note: '',
-        value: !review && j.word === job.word ? (task === 'ipa' ? '/al-ʔuḫrā/' : 'həloʊ') :
-          task === 'ipa' ? '/alʔuxraː/' : 'al ujrá' })), api);
+      return response(input.words.map((j) => task === 'ipa' ? { index: j.index, word: j.word, status: 'ready', note: '',
+        value: !review && j.word === job.word ? '/al-ʔuḫrā/' : '/alʔuxraː/' } :
+        pairedRow(j, j.transcription ?? '/alʔuxraː/', !review && j.word === job.word ? 'həloʊ' : 'al ujrá')), api);
     } });
     const result = await ai.generate(task, jobs, source, task === 'respell' ? target : null,
       async (rows) => emissions.push(rows));
@@ -149,7 +153,7 @@ test('both APIs inject only the requested target inventory before words and repa
     assert.ok(logs.some((s) => /2 finalized \(1 reviewed\)/.test(s)));
     const saved = readdirSync(join(cfg.stateDir, 'results')).map((file) => JSON.parse(readFileSync(join(cfg.stateDir, 'results', file))));
     assert.equal(saved.length, 2);
-    assert.ok(saved.every((r) => r.value === (task === 'ipa' ? '/alʔuxraː/' : 'al ujrá')));
+    assert.ok(saved.every((r) => (task === 'ipa' ? r.value === '/alʔuxraː/' : r.respelling === 'al ujrá' && r.transcription === '/alʔuxraː/')));
   }
 });
 
@@ -172,20 +176,25 @@ test('population repairs both missing IPA and respellings before their database 
     };
     const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
       const body = JSON.parse(options.body), input = inputOf(body, 'responses');
-      const task = input.words[0].ipa ? 'respell' : 'ipa';
       const review = input.words[0].note !== undefined;
-      stages.push(`${task}-${review ? 'review' : 'first'}`);
-      const bad = task === 'ipa' ? '/al-ʔuḫrā/' : 'həloʊ';
-      const good = task === 'ipa' ? '/alʔuxraː/' : 'al ujrá';
-      return response(input.words.map((j) => ({ ...row(review && failedTask !== task ? good : bad), index: j.index, word: j.word })), 'responses');
+      stages.push(review ? 'pair-review' : 'pair-first');
+      if (review) {
+        assert.equal(input.words[0].transcription, null);
+        assert.equal(input.words[0].candidate.transcriptionStatus, 'review');
+        assert.equal(input.words[0].candidate.respellingStatus, 'review');
+        assert.deepEqual(e.transcriptions, [], 'Review must finish before either field is inserted');
+      }
+      return response(input.words.map((j) => pairedRow(j,
+        review && failedTask !== 'ipa' ? '/alʔuxraː/' : '/al-ʔuḫrā/',
+        review && failedTask !== 'respell' ? 'al ujrá' : 'həloʊ')), 'responses');
     } });
     if (failedTask) {
       await assert.rejects(populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 }), /review pass rejected/);
-      assert.deepEqual(stages, failedTask === 'ipa' ? ['ipa-first', 'ipa-review'] :
-        ['ipa-first', 'ipa-review', 'insert-ipa', 'respell-first', 'respell-review']);
+      assert.deepEqual(stages, ['pair-first', 'pair-review']);
+      assert.deepEqual(e.transcriptions, []);
     } else {
       await populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 });
-      assert.deepEqual(stages, ['ipa-first', 'ipa-review', 'insert-ipa', 'respell-first', 'respell-review', 'insert-respell']);
+      assert.deepEqual(stages, ['pair-first', 'pair-review', 'insert-ipa', 'insert-respell']);
     }
     assert.deepEqual(readdirSync(cfg.stateDir), []);
   }

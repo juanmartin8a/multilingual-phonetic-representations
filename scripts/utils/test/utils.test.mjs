@@ -1,6 +1,6 @@
 import { test } from 'bun:test';
 import assert from 'node:assert/strict';
-import { tursoSettings, connectTurso, withTransaction } from '../turso.mjs';
+import { tursoSettings, connectTurso, withTransaction, retryTursoRead } from '../turso.mjs';
 import { createGateway, requestBody, outputText, BudgetReachedError } from '../ai-gateway.mjs';
 
 const settings = { TURSO_DATABASE_URL: 'libsql://test.turso.io', TURSO_AUTH_TOKEN: 'fake-token' };
@@ -24,6 +24,7 @@ test('shared Turso connections propagate caller cancellation and reject redirect
   const client = connectTurso(tursoSettings(settings), { createClientFn: (value) => { config = value; return 'client'; },
     fetchFn: async (input, options) => {
       assert.equal(options.redirect, 'error');
+      assert.equal(options.keepalive, false);
       assert.equal(options.signal.aborted, true);
       return 'response';
     } });
@@ -99,6 +100,101 @@ test('a transaction commit failure rolls back and closes the transaction', async
   }) };
   await assert.rejects(withTransaction(client, 'write', async () => 42), (error) => error === original);
   assert.deepEqual(events, ['commit', 'rollback', 'close']);
+});
+
+const socketError = () => Object.assign(new Error('The socket connection was closed unexpectedly'),
+  { code: 'ConnectionClosed' });
+
+test('Turso reads retry connection errors with bounded backoff and safe diagnostics', async () => {
+  let calls = 0;
+  const delays = [], logs = [];
+  const original = Object.assign(new Error('secret-token must not appear in logs'), { code: 'ECONNRESET' });
+  const wrapped = new Error('stream failed', { cause: original });
+  await assert.rejects(retryTursoRead(async () => { calls++; throw wrapped; }, {
+    wait: async (ms) => delays.push(ms), log: (line) => logs.push(line),
+  }), (error) => /Turso database read failed after 3 attempts \(ECONNRESET\)/.test(error.message) &&
+    error.cause === wrapped && !error.message.includes('secret-token'));
+  assert.equal(calls, 3);
+  assert.deepEqual(delays, [1000, 2000]);
+  assert.equal(logs.length, 2);
+  assert.equal(logs.join().includes('secret-token'), false);
+
+  for (const error of [new Error('SQL error'), Object.assign(new Error('Unauthorized'), { code: 'SERVER_ERROR' }),
+    new DOMException('cancelled', 'AbortError'), new TypeError('invalid URL')]) {
+    calls = 0;
+    await assert.rejects(retryTursoRead(async () => { calls++; throw error; }, {
+      wait: async () => assert.fail('must not wait'), log: () => assert.fail('must not retry'),
+    }), (value) => value === error);
+    assert.equal(calls, 1);
+  }
+});
+
+test('read retries restart and clean up the entire transaction after begin, query or commit failures', async () => {
+  for (const phase of ['begin', 'query', 'commit']) {
+    const events = [];
+    let attempts = 0;
+    const client = { transaction: async (mode) => {
+      assert.equal(mode, 'read');
+      const attempt = ++attempts;
+      events.push(`begin${attempt}`);
+      if (attempt === 1 && phase === 'begin') throw socketError();
+      return {
+        execute: async () => { events.push(`query${attempt}`); if (attempt === 1 && phase === 'query') throw socketError(); return 42; },
+        commit: async () => { events.push(`commit${attempt}`); if (attempt === 1 && phase === 'commit') throw socketError(); },
+        rollback: async () => { events.push(`rollback${attempt}`); throw new Error('rollback unavailable'); },
+        close: () => events.push(`close${attempt}`),
+      };
+    } };
+    assert.equal(await withTransaction(client, 'read', (tx) => tx.execute('SELECT 42'), {
+      wait: async () => events.push('wait'), log: () => {},
+    }), 42);
+    assert.equal(attempts, 2);
+    if (phase !== 'begin') {
+      assert.ok(events.indexOf('rollback1') < events.indexOf('close1'));
+      assert.ok(events.indexOf('close1') < events.indexOf('begin2'));
+    }
+    assert.deepEqual(events.slice(-4), ['begin2', 'query2', 'commit2', 'close2']);
+  }
+});
+
+test('an interrupted write commit is reported without replaying the transaction', async () => {
+  const events = [];
+  const original = socketError();
+  const client = { transaction: async () => {
+    events.push('begin');
+    return { commit: async () => { events.push('commit'); throw original; },
+      rollback: async () => events.push('rollback'), close: () => events.push('close') };
+  } };
+  await assert.rejects(withTransaction(client, 'write', async () => events.push('write')),
+    (error) => /Turso database write failed.*commit status may be unknown/.test(error.message) && error.cause === original);
+  assert.deepEqual(events, ['begin', 'write', 'commit', 'rollback', 'close']);
+});
+
+test('real Turso HTTP reads recover from fetch and response-body socket failures', async () => {
+  for (const phase of ['fetch', 'body']) {
+    let calls = 0;
+    const client = connectTurso(tursoSettings(settings), { fetchFn: async (input, options) => {
+      calls++;
+      assert.equal(options.keepalive, false);
+      if (calls === 1) {
+        if (phase === 'fetch') throw socketError();
+        return new Response(new ReadableStream({ start(controller) { controller.error(socketError()); } }),
+          { headers: { 'content-type': 'application/json' } });
+      }
+      const body = await input.json();
+      return Response.json({ baton: null, base_url: null, results: body.requests.map((request) => ({
+        type: 'ok', response: request.type === 'execute' ? { type: 'execute', result: {
+          cols: [{ name: 'n', decltype: 'INTEGER' }], rows: [[{ type: 'integer', value: '42' }]],
+          affected_row_count: 0, last_insert_rowid: null,
+        } } : { type: request.type },
+      })) });
+    } });
+    try {
+      const result = await retryTursoRead(() => client.execute('SELECT 42 AS n'), { wait: async () => {}, log: () => {} });
+      assert.equal(result.rows[0].n, 42);
+      assert.equal(calls, 2);
+    } finally { client.close(); }
+  }
 });
 
 test('shared Gateway supports unrelated script payloads and caller metadata while accounting for budgets', async () => {

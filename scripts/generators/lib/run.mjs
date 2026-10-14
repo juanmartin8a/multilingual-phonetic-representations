@@ -20,40 +20,65 @@ async function processBatch(cfg, db, ai, entries, source, target, log) {
   const pending = entries.reduce((sum, entry) => sum + entry.transcriptions.filter((t) => !t.hasRespelling).length, 0);
   log(`${source.code}: ${entries.length} words, ${missing.length} missing IPA` +
     (target ? `, ${pending} missing ${target.code} respellings (+ words needing IPA)` : ''));
-  const byId = new Map(missing.map((entry) => [entry.id, entry]));
-  const ipa = await ai.generate('ipa', missing.map((entry) => ({ key: entry.id, word: entry.orthographic_form })),
-    source, null, async (records) => {
-      if (!cfg.write) return;
-      await insertBatches(db.insertTranscriptions, records.map((record) => {
-        const entry = byId.get(record.key);
-        return { entry_id: entry.id, orthographic_form: entry.orthographic_form,
-          language_id: entry.language_id, language_code: source.code, transcription: record.value };
-      }), cfg.batchSize);
-    });
-  if (!target) return;
-  if (cfg.write && missing.length) {
-    const refreshed = new Map((await db.refreshEntries(missing, cfg.targetId)).map((entry) => [entry.id, entry]));
-    entries = entries.map((entry) => refreshed.get(entry.id) ?? entry);
-  } else if (!cfg.write) {
-    entries = entries.map((entry) => ({ ...entry,
-      transcriptions: entry.transcriptions.length ? entry.transcriptions : ipa.has(entry.id) ?
-        [{ transcription: ipa.get(entry.id).value, hasRespelling: false }] : [],
-    }));
+  if (!target) {
+    const byId = new Map(missing.map((entry) => [entry.id, entry]));
+    await ai.generate('ipa', missing.map((entry) => ({ key: entry.id, word: entry.orthographic_form })),
+      source, null, async (records) => {
+        if (!cfg.write) return;
+        await insertBatches(db.insertTranscriptions, records.map((record) => {
+          const entry = byId.get(record.key);
+          return { entry_id: entry.id, orthographic_form: entry.orthographic_form,
+            language_id: entry.language_id, language_code: source.code, transcription: record.value };
+        }), cfg.batchSize);
+      });
+    return;
   }
-  const candidates = entries.flatMap((entry) => entry.transcriptions.filter((t) => !t.hasRespelling)
-    .map((transcription) => ({ entry, transcription, key: pronunciationKey(entry.id, transcription.transcription) })));
-  // Duplicate IPA documents share generated text, but each gets its own link.
-  const jobs = [...new Map(candidates.map(({ key, entry, transcription }) => [key,
-    { key, word: entry.orthographic_form, ipa: transcription.transcription }])).values()];
+
+  // Each missing reading is an independent job. Entries without IPA contribute
+  // one job with null IPA; duplicate IPA documents share a generated pair.
+  const candidates = entries.flatMap((entry) => (entry.transcriptions.length ?
+    entry.transcriptions.filter((t) => !t.hasRespelling) : [{ transcription: null }])
+    .map((transcription) => ({ entry, transcription,
+      key: pronunciationKey(entry.id, transcription.transcription) })));
+  const byKey = new Map(candidates.map((candidate) => [candidate.key, candidate]));
+  const jobs = [...byKey.values()].map(({ key, entry, transcription }) =>
+    ({ key, word: entry.orthographic_form, transcription: transcription.transcription,
+      // Existing IPA may be the result of a partially imported local pair.
+      ...(transcription.transcription !== null ? { cacheFallback: {
+        key: pronunciationKey(entry.id, null), word: entry.orthographic_form, transcription: null,
+      } } : {}) }));
   await ai.generate('respell', jobs, source, target, async (records) => {
-    if (!cfg.write) return;
-    const values = new Map(records.map((record) => [record.key, record.value]));
-    await insertBatches(db.insertRespellings, candidates.filter(({ key }) => values.has(key))
-      .map(({ key, entry, transcription }) => ({
-        phonetic_transcription_id: transcription.id, transcription: transcription.transcription,
+    if (!cfg.write || !records.length) return;
+    // Neither component is written until the complete pair has passed review.
+    const newIpa = records.filter((record) => byKey.get(record.key).transcription.transcription === null);
+    let refreshed = new Map();
+    if (newIpa.length) {
+      await insertBatches(db.insertTranscriptions, newIpa.map((record) => {
+        const { entry } = byKey.get(record.key);
+        return { entry_id: entry.id, orthographic_form: entry.orthographic_form,
+          language_id: entry.language_id, language_code: source.code, transcription: record.transcription };
+      }), cfg.batchSize);
+      refreshed = new Map((await db.refreshEntries(newIpa.map((record) => byKey.get(record.key).entry),
+        cfg.targetId)).map((entry) => [entry.id, entry]));
+    }
+    const values = new Map(records.map((record) => [record.key, record]));
+    const rows = [];
+    for (const { key, entry, transcription } of candidates) {
+      const record = values.get(key);
+      if (!record) continue;
+      const readings = transcription.transcription === null ?
+        refreshed.get(entry.id)?.transcriptions.filter((t) => t.transcription === record.transcription) ?? [] :
+        [transcription];
+      // A concurrent writer may have inserted a different reading. Never attach
+      // this guide to that IPA; a later scan will generate its own respelling.
+      if (!readings.length) log(`respell: skipped ${JSON.stringify(entry.orthographic_form)}: finalized IPA not found after insertion; rerun to retry`);
+      for (const reading of readings.filter((t) => !t.hasRespelling)) rows.push({
+        phonetic_transcription_id: reading.id, transcription: record.transcription,
         orthographic_form: entry.orthographic_form, source_language_code: source.code,
-        target_language_id: cfg.targetId, target_language_code: target.code, respelling: values.get(key),
-      })), cfg.batchSize);
+        target_language_id: cfg.targetId, target_language_code: target.code, respelling: record.respelling,
+      });
+    }
+    await insertBatches(db.insertRespellings, rows, cfg.batchSize);
   });
 }
 

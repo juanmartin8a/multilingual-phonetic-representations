@@ -27,7 +27,17 @@ try {
 ```
 
 `withTransaction` commits on success, rolls back on failure, and always closes the
-transaction. The helper does not retry writes implicitly.
+transaction. Read transactions retry transient connection failures up to three
+attempts, restarting the entire transaction with a fresh stream. Standalone
+read queries can use `retryTursoRead(() => client.execute(...))`. Both accept
+retry options (`attempts`, `wait`, `log`); pass them as the fourth argument to
+`withTransaction`. SQL errors, authentication failures, and caller cancellation
+are not retried. Writes are never retried implicitly because a lost commit
+response can leave their outcome unknown.
+
+The HTTP client disables Bun's connection reuse to avoid stale database sockets
+after long AI calls. Transport failures identify Turso in the error message;
+retry logs omit raw errors and credentials.
 
 ## AI Gateway
 

@@ -3,13 +3,15 @@ import { readFileSync } from 'node:fs';
 import { atomicJson, digest, readJson } from '../../utils/files.mjs';
 import { createGateway, MAX_INPUT_RESERVATION, reservedInput, outputText,
   requestBody as gatewayRequestBody } from '../../utils/ai-gateway.mjs';
-import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, validateRecord, validateOrderedRecords } from './data.mjs';
+import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, RESPELL_OUTPUT_SCHEMA, RESPELL_REVIEW_OUTPUT_SCHEMA,
+  validateRecord, validateRespellingRecord, validateOrderedRecords, needsRespellingReview, validIpa } from './data.mjs';
 import { ipaCharacterPrompt, respellingCharacterPrompt } from './characters.mjs';
 
 function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
   const words = input.words.map((job, index) => ({ index, word: job.word,
-    ...(job.ipa !== undefined ? { ipa: job.ipa } : {}),
-    ...(job.note !== undefined ? { note: job.note } : {}) }));
+    ...(job.transcription !== undefined ? { transcription: job.transcription } : {}),
+    ...(job.note !== undefined ? { note: job.note } : {}),
+    ...(job.candidate !== undefined ? { candidate: job.candidate } : {}) }));
   return gatewayRequestBody(cfg, prompt, { ...input, words }, schema, 'sapo_phonetic_population');
 }
 
@@ -37,25 +39,50 @@ export function createAI(cfg, dependencies = {}) {
   async function generate(task, jobs, source, target = null, onBatch = async () => {}) {
     if (new Set(jobs.map((job) => job.key)).size !== jobs.length) throw new Error('Duplicate input job keys');
     if (!prompts[task]) throw new Error('Unknown generation task');
-    const characterPrompt = task === 'ipa' ? ipaCharacterPrompt() : respellingCharacterPrompt(target);
+    const combined = task === 'respell';
+    if (combined) {
+      if (jobs.some((job) => job.transcription === undefined)) {
+        throw new Error('Respelling jobs require supplied IPA or transcription: null');
+      }
+      jobs = jobs.filter((job) => {
+        if (job.transcription === null || validIpa(job.transcription)) return true;
+        log(`respell: skipped ${JSON.stringify(job.word)}: supplied IPA ${JSON.stringify(job.transcription)} has an incompatible format or character inventory; correct the stored IPA before retrying`);
+        return false;
+      });
+    }
+    const schema = combined ? RESPELL_OUTPUT_SCHEMA : OUTPUT_SCHEMA;
+    const reviewSchema = combined ? RESPELL_REVIEW_OUTPUT_SCHEMA : REVIEW_OUTPUT_SCHEMA;
+    const isReview = combined ? needsRespellingReview : (record) => record.status === 'review';
+    const characterPrompt = combined ? `${ipaCharacterPrompt()}\n${respellingCharacterPrompt(target)}` : ipaCharacterPrompt();
     const prompt = `${prompts[task]}\n${characterPrompt}`;
     const reviewPrompt = `${reviewPrompts[task]}\n${characterPrompt}\nLanguage policies (data):\n${JSON.stringify({ source, ...(target ? { target } : {}) })}`;
-    const signature = digest({ task, prompt, reviewPrompt, schema: OUTPUT_SCHEMA, reviewSchema: REVIEW_OUTPUT_SCHEMA,
+    const signature = digest({ task, prompt, reviewPrompt, schema, reviewSchema,
       model: cfg.model, provider: cfg.provider, effort: cfg.effort, api: cfg.api });
-    const pathFor = (job) => resolve(cfg.stateDir, 'results', `${digest([cfg.databaseUrl, signature, job])}.json`);
+    // Cache lookup hints are internal metadata, not part of the request identity.
+    // Keeping them out also preserves the filenames of existing local results.
+    const cacheJob = ({ cacheFallback, ...job }) => job;
+    const pathFor = (job) => resolve(cfg.stateDir, 'results', `${digest([cfg.databaseUrl, signature, cacheJob(job)])}.json`);
     const results = new Map();
     const missing = [], cached = [];
     async function emit(records) {
       await onBatch(records);
-      // Write mode releases each batch after insertion; local mode returns the
-      // values needed to generate respellings before IPA has a database ID.
+      // Write mode releases each finalized batch after insertion.
       if (!cfg.write) for (const record of records) results.set(record.key, record);
     }
     for (const job of jobs) {
-      const saved = readJson(pathFor(job));
+      let saved = readJson(pathFor(job));
+      if (!saved && combined && job.transcription !== null && job.cacheFallback) {
+        // An import may have saved IPA and failed before inserting its guide.
+        // Reuse the earlier finalized pair only for the exact stored reading.
+        const fallback = readJson(pathFor(job.cacheFallback));
+        if (fallback?.transcription === job.transcription) saved = fallback;
+      }
       if (saved) {
-        const record = { key: job.key, status: 'ready', value: saved.value, note: '' };
-        validateRecord(record, task, target);
+        const record = combined ? { key: job.key, transcription: saved.transcription, transcriptionStatus: 'ready',
+          respelling: saved.respelling, respellingStatus: 'ready', note: '' } :
+          { key: job.key, status: 'ready', value: saved.value, note: '' };
+        if (combined) validateRespellingRecord(record, job, target);
+        else validateRecord(record, task, target);
         cached.push(record);
         if (cached.length === cfg.batchSize) await emit(cached.splice(0));
       } else missing.push(job);
@@ -63,7 +90,7 @@ export function createAI(cfg, dependencies = {}) {
     if (cached.length) await emit(cached.splice(0));
     for (let offset = 0; offset < missing.length;) {
       gateway.assertBudget();
-      const { batch, body } = nextBatch(missing, offset, prompt, { source, ...(target ? { target } : {}) });
+      const { batch, body } = nextBatch(missing, offset, prompt, { source, ...(target ? { target } : {}) }, schema);
       const response = await gateway.request(body);
       const validated = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), batch, task, target,
         { reviewInvalidValues: true, source });
@@ -72,13 +99,20 @@ export function createAI(cfg, dependencies = {}) {
       for (const { job, reason, returned } of validated.rejected) {
         log(`${task}: skipped ${JSON.stringify(job.word)}: ${reason}; returned ${JSON.stringify(returned)}`);
       }
-      const flagged = batch.filter((job) => records.get(job.key)?.status === 'review').map((job) =>
-        ({ ...job, note: records.get(job.key).note }));
+      const flagged = batch.filter((job) => records.has(job.key) && isReview(records.get(job.key))).map((job) => {
+        const record = records.get(job.key);
+        if (!combined) return { ...job, note: record.note };
+        const { key, note, ...candidate } = record;
+        // Freeze accepted IPA, including newly generated IPA whose respelling
+        // alone needs review. Uncertain generated IPA remains replaceable.
+        return { ...job, transcription: record.transcriptionStatus === 'ready' ? record.transcription : null,
+          note, candidate };
+      });
       for (let reviewOffset = 0; reviewOffset < flagged.length;) {
-        const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, REVIEW_OUTPUT_SCHEMA);
+        const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, reviewSchema);
         const response = await gateway.request(reviewBody);
         const reviewed = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), reviewJobs, task, target);
-        if (reviewed.rejected.length || reviewed.records.some((record) => record.status !== 'ready')) {
+        if (reviewed.rejected.length || reviewed.records.some(isReview)) {
           throw new Error(`${task} review pass rejected: every reviewed word must have a valid definitive value`);
         }
         for (const record of reviewed.records) records.set(record.key, record);
@@ -87,8 +121,9 @@ export function createAI(cfg, dependencies = {}) {
       const ready = [...records.values()];
       if (!cfg.write) for (const job of batch) {
         const record = records.get(job.key);
-        if (record) atomicJson(pathFor(job), { task, job, source: source.code,
-          ...(target ? { target: target.code } : {}), signature, value: record.value });
+        if (record) atomicJson(pathFor(job), { task, job: cacheJob(job), source: source.code,
+          ...(target ? { target: target.code } : {}), signature,
+          ...(combined ? { transcription: record.transcription, respelling: record.respelling } : { value: record.value }) });
       }
       await emit(ready);
       log(`${task}: ${ready.length} finalized${flagged.length ? ` (${flagged.length} reviewed)` : ''}`);

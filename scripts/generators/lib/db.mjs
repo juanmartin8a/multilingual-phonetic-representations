@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { connectTurso, withTransaction } from '../../utils/turso.mjs';
+import { connectTurso, withTransaction, retryTursoRead } from '../../utils/turso.mjs';
 import { languagePolicy, validIpa, validRespelling } from './data.mjs';
 
 const placeholders = (rows) => rows.map(() => '?').join(', ');
@@ -32,9 +32,9 @@ export function createPopulationDatabase(client, { write = false, languagePolici
   return {
     close: () => client.close(),
     async languages() {
-      const result = await client.execute(`SELECT l.id, l.language_code, l.name,
+      const result = await retryTursoRead(() => client.execute(`SELECT l.id, l.language_code, l.name,
         EXISTS (SELECT 1 FROM entries e WHERE e.language_id = l.id) AS hasEntries
-        FROM languages l ORDER BY l.language_code`);
+        FROM languages l ORDER BY l.language_code`));
       return result.rows.map((row) => ({ id: row.id, language_code: row.language_code,
         name: row.name, hasEntries: Boolean(row.hasEntries) }));
     },
