@@ -599,7 +599,7 @@ test('both APIs review only flagged words and notes with the same model and a di
   }
 });
 
-test('review output must be definitive, correctly aligned and valid before any database write', async () => {
+test('invalid IPA review output is skipped without database writes or cached candidates', async () => {
   const invalid = [
     (r) => (flagReview(r, 'Still unsure')),
     (r) => ({ ...r, value: null }),
@@ -612,12 +612,59 @@ test('review output must be definitive, correctly aligned and valid before any d
     const cfg = fixture({ write: true });
     const db = fakeDatabase([entry('1')]);
     const count = { calls: 0 };
-    const ai = createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
+    const logs = [];
+    const ai = createAI(cfg, { log: (text) => logs.push(text), fetchFn: fakeFetch(count, (rows) => answer(rows.map((r) =>
       count.calls === 1 ? flagReview(r, 'Ambiguous') : transform(r)))) });
-    await assert.rejects(populate('transcriptions', cfg, db, ai, { log: () => {} }), /review pass rejected/);
+    await populate('transcriptions', cfg, db, ai, { log: () => {} });
     assert.equal(db.calls.ipa, 0);
     assert.deepEqual(readdirSync(cfg.stateDir), []);
     assert.equal(count.calls, 2);
+    assert.ok(logs.some((text) => text.includes('ipa review: skipped "word-1"')));
+  }
+});
+
+test('IPA review saves valid siblings, continues to later batches and retries only skipped words', async () => {
+  for (const api of ['responses', 'chat']) for (const write of [false, true]) {
+    const cfg = fixture({ api, write, batchSize: 3, batchSizeMultiplicity: 2 });
+    const db = fakeDatabase([entry('1'), entry('2'), entry('3'), entry('4')]);
+    const requests = [], logs = [];
+    let retry = false;
+    const dependencies = { log: (text) => logs.push(text), fetchFn: async (url, options) => {
+      const body = JSON.parse(options.body);
+      const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+      requests.push(input.words);
+      const reviewing = input.words[0].note !== undefined;
+      const records = input.words.map((job) => {
+        const record = modelRow(job, '/a/');
+        if (retry) return record;
+        if (job.word === 'word-1') return { ...record, value: '/ḫ/' };
+        if (job.word === 'word-3' && !reviewing) return flagReview(record, 'Ambiguous reading');
+        return record;
+      });
+      return Response.json(api === 'responses' ? answer(records) : {
+        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
+        usage: { prompt_tokens: 2000, completion_tokens: 500,
+          prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      });
+    } };
+    await populate('transcriptions', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.deepEqual(requests.map((words) => words.map((job) => job.word)),
+      [['word-1', 'word-2', 'word-3'], ['word-1', 'word-3'], ['word-4']]);
+    assert.ok(logs.some((text) => text.includes('ipa review: skipped "word-1": Invalid ipa value')));
+    assert.ok(logs.some((text) => text === 'ipa: 2 finalized (1 reviewed)'));
+    assert.deepEqual(db.entries.map((e) => e.transcriptions.length), write ? [0, 1, 1, 1] : [0, 0, 0, 0]);
+    if (write) assert.deepEqual(readdirSync(cfg.stateDir), []);
+    else {
+      const saved = readdirSync(join(cfg.stateDir, 'results')).map((file) => readJson(join(cfg.stateDir, 'results', file)));
+      assert.deepEqual(saved.map((item) => item.job.word).sort(), ['word-2', 'word-3', 'word-4']);
+      assert.ok(saved.every((item) => item.value === '/a/'));
+    }
+    retry = true;
+    await populate('transcriptions', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 4);
+    assert.deepEqual(requests[3].map((job) => job.word), ['word-1']);
+    if (write) assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 4);
   }
 });
 

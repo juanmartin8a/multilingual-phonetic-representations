@@ -110,7 +110,10 @@ unchanged. Runs stop when all eligible selections have been scanned or the
 spending threshold is reached. Generated results are
 checked against the input words and the allowed pronunciation characters.
 Items flagged for review receive a separate automated editing pass before
-being finalized. Respelling records use `transcription` and `respelling` fields,
+being finalized. In transcription generation, words that still fail review
+validation are logged and skipped; valid words in the batch are saved and the
+scan continues. Skipped words remain eligible for a later run. Respelling
+records use `transcription` and `respelling` fields,
 with separate `transcriptionStatus` and `respellingStatus` review decisions.
 The reviewer preserves accepted IPA; when newly generated IPA needs
 review, it finalizes the IPA first and regenerates the guide to match. Both
