@@ -157,11 +157,12 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
       // Only correctly aligned records can enter review. The definitive review
       // pass and database validation remain strict: repair is first-pass only.
       if (task === 'respell') {
-        if (job.transcription !== null) {
+        if (job.transcription !== null && reviewInvalidValues) {
           const changed = record.transcription !== job.transcription || record.transcriptionStatus !== 'ready';
-          // Supplied IPA is owned by the caller, never by either model pass.
+          // First-pass mismatches trigger guide review; final review must
+          // preserve the input IPA exactly or the pair is rejected below.
           record = { ...record, transcription: job.transcription, transcriptionStatus: 'ready' };
-          if (reviewInvalidValues && changed && typeof record.note === 'string' && record.note.length <= 500 &&
+          if (changed && typeof record.note === 'string' && record.note.length <= 500 &&
               ['ready', 'review'].includes(record.respellingStatus)) {
             // A guide generated against a different IPA must be reassessed.
             const note = `Use authoritative input IPA ${JSON.stringify(job.transcription)}; the returned IPA or its status was ignored. Reassess the guide against the input IPA.`;

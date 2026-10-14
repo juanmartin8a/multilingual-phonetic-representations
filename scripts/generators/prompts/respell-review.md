@@ -8,6 +8,8 @@ note or candidate is not authoritative.
 The top-level input transcription is authoritative when non-null. It may be
 existing database IPA or accepted newly generated IPA. Copy it exactly and never
 replace it with a different dictionary reading inferred from word or note.
+If your output transcription differs from the supplied IPA, the entire pair
+will be rejected even when the guide uses valid characters.
 When top-level transcription is null, candidate.transcription is uncertain and
 may be replaced. Generate or correct the IPA using source.code and source.dialect,
 honoring overrides. Choose the most widely accepted dictionary citation reading;

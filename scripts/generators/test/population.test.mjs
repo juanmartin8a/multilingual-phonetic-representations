@@ -1417,11 +1417,13 @@ test('combined validation takes supplied IPA from input and reviews guides when 
     assert.equal(first.records[0].respellingStatus, 'review');
     assert.match(first.records[0].note, /authoritative input IPA/);
     const final = validateOrderedRecords(output, [job], 'respell', target);
-    assert.deepEqual(final.rejected, []);
-    assert.equal(final.records[0].transcription, '/riːd/');
-    assert.equal(final.records[0].transcriptionStatus, 'ready');
-    assert.equal(final.records[0].respellingStatus, 'ready');
+    assert.deepEqual(final.records, []);
+    assert.equal(final.rejected.length, 1);
+    assert.match(final.rejected[0].reason, /Supplied IPA must be preserved exactly/);
   }
+  const matching = validateOrderedRecords({ records: [original] }, [job], 'respell', target);
+  assert.deepEqual(matching.rejected, []);
+  assert.equal(matching.records[0].transcription, '/riːd/');
 });
 
 test('respelling review saves valid pairs, continues scanning and retries rejected pairs in both modes and APIs', async () => {
@@ -1453,7 +1455,7 @@ test('respelling review saves valid pairs, continues scanning and retries reject
         if (j.word === 'word-1') return { ...record, transcription: '/ḫ/' };
         if (j.word === 'word-2') return { ...record, respelling: 'həloʊ' };
         if (j.word === 'word-3' && !reviewing) return { ...record, transcription: '/ḫ/', respelling: 'həloʊ' };
-        if (j.word === 'word-4') return { ...record, transcription: reviewing ? null : '/b/' };
+        if (j.word === 'word-4') return { ...record, transcription: reviewing ? j.transcription : '/b/' };
         return record;
       });
       return Response.json(api === 'responses' ? answer(records) : {
@@ -1511,32 +1513,59 @@ test('combined validation rejects malformed records before review', () => {
     respellingStatus: 'ready', note: 'IPA uncertain' }, jobs[1], target), /Uncertain IPA/);
 });
 
-test('review uses input IPA regardless of returned IPA for existing and accepted new readings', async () => {
-  for (const write of [false, true]) for (const existing of [false, true]) {
-    const cfg = fixture({ write });
-    const db = fakeDatabase([entry('1', 'en', existing ? [{ id: 'old', transcription: '/a/', targets: [] }] : [])]);
-    let calls = 0;
-    const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
-      calls++;
-      const input = JSON.parse(JSON.parse(options.body).input[1].content);
-      const records = input.words.map((j) => calls === 1 ?
-        flagReview({ ...modelRespellingRow(j), transcription: '/a/' }, 'Guide needs review') :
-        { ...modelRespellingRow(j), transcription: '/b/' });
-      return Response.json(answer(records));
-    } });
-    await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
-    assert.equal(calls, 2);
-    if (write) {
-      assert.equal(db.calls.ipa, existing ? 0 : 1);
-      assert.equal(db.calls.respell, 1);
+test('review IPA mismatches reject only their pairs, preserve existing or accepted IPA and retry later', async () => {
+  for (const api of ['responses', 'chat']) for (const write of [false, true]) for (const existing of [false, true]) {
+    const cfg = fixture({ api, write });
+    const db = fakeDatabase([entry('1', 'en', existing ? [{ id: 'old', transcription: '/a/', targets: [] }] : []), entry('2')]);
+    const requests = [], logs = [];
+    let retry = false;
+    const dependencies = { log: (text) => logs.push(text), fetchFn: async (url, options) => {
+      const body = JSON.parse(options.body);
+      const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+      requests.push(input.words);
+      const reviewing = input.words[0].note !== undefined;
+      if (reviewing) assert.ok(input.words.every((j) => j.transcription === '/a/'));
+      const records = input.words.map((j) => {
+        const record = { ...modelRespellingRow(j, 'a'), transcription: '/a/' };
+        if (retry) return record;
+        if (reviewing) return j.word === 'word-1' ? { ...record, transcription: '/b/', respelling: 'b' } : record;
+        if (existing && j.word === 'word-1') return { ...record, transcription: '/b/', respelling: 'b' };
+        return flagReview(record, 'Guide needs review');
+      });
+      return Response.json(api === 'responses' ? answer(records) : {
+        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
+        usage: { prompt_tokens: 2000, completion_tokens: 500,
+          prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      });
+    } };
+    await populate('respellings', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 2);
+    assert.ok(logs.some((text) => text.includes('respell review: skipped "word-1": Supplied IPA must be preserved exactly')));
+    assert.equal(db.entries[0].transcriptions.length, existing ? 1 : 0);
+    if (existing) {
+      assert.equal(db.entries[0].transcriptions[0].id, 'old');
       assert.equal(db.entries[0].transcriptions[0].transcription, '/a/');
-      assert.deepEqual(db.entries[0].transcriptions[0].targets, ['es']);
+      assert.deepEqual(db.entries[0].transcriptions[0].targets, []);
+    }
+    if (write) {
+      assert.equal(db.calls.ipa, 1);
+      assert.equal(db.calls.respell, 1);
+      assert.equal(db.entries[1].transcriptions[0].transcription, '/a/');
+      assert.deepEqual(db.entries[1].transcriptions[0].targets, ['es']);
       assert.deepEqual(readdirSync(cfg.stateDir), []);
     } else {
       const saved = readdirSync(join(cfg.stateDir, 'results')).map((f) => readJson(join(cfg.stateDir, 'results', f)));
       assert.equal(saved.length, 1);
+      assert.equal(saved[0].job.word, 'word-2');
       assert.equal(saved[0].transcription, '/a/');
+      assert.equal(saved[0].respelling, 'a');
     }
+    retry = true;
+    await populate('respellings', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 3);
+    assert.deepEqual(requests[2].map((j) => [j.word, j.transcription]), [['word-1', existing ? '/a/' : null]]);
+    if (write) assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 2);
   }
 });
 

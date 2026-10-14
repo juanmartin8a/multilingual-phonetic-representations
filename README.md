@@ -115,9 +115,10 @@ are logged and skipped; valid items in the batch are saved and the scan
 continues. Skipped items remain eligible for a later run. Respelling
 records use `transcription` and `respelling` fields,
 with separate `transcriptionStatus` and `respellingStatus` review decisions.
-Supplied IPA is taken directly from the input in both passes, regardless of
-the model's returned IPA. If the first pass changes supplied IPA or flags it
+Supplied IPA always remains authoritative. If the first pass changes it or flags it
 for review, only the guide is sent for review against the original IPA.
+If final review returns different IPA, the pair is rejected and existing IPA
+is left untouched; valid pairs in the batch are still saved.
 When newly generated IPA needs review, the reviewer finalizes it first and
 regenerates the guide to match; accepted new IPA stays locked during guide
 review. Invalid first-pass characters or formatting add diagnostic notes and
