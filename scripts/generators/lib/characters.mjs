@@ -2,7 +2,7 @@
 // https://www.internationalphoneticassociation.org/IPAcharts/common_files/pdfs/pdfs_IPA_charts_E/IPA_DejaVu_sl.pdf
 // Main chart revised to 2015/2005; symbol list accessed 2026-10-11.
 // Additional symbols documented in that list are separate from the main chart.
-export const IPA_CHARACTERS = {
+const IPA_CHARACTERS = {
   consonants: 'pbtdʈɖcɟkɡqɢʔmɱnɳɲŋɴʙrʀⱱɾɽɸβfvθðszʃʒʂʐçʝxɣχʁħʕhɦɬɮʋɹɻjɰlɭʎʟʘǀǃǂǁɓɗʄɠʛʍwɥʜʢʡɕʑɺɧɫ',
   vowels: 'iyɨʉɯuɪʏʊeøɘɵɤoəɛœɜɞʌɔæɐaɶɑɒɚ',
   modifiers: 'ʼʰʷʲˠˤ˞ⁿˡ',
