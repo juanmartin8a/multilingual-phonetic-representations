@@ -113,9 +113,6 @@ export function createAI(cfg, dependencies = {}) {
         const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, reviewSchema);
         const response = await gateway.request(reviewBody);
         const reviewed = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), reviewJobs, task, target);
-        if (combined && (reviewed.rejected.length || reviewed.records.some(isReview))) {
-          throw new Error(`${task} review pass rejected: every reviewed word must have a valid definitive value`);
-        }
         // Remove first-pass candidates so rejected reviews cannot be saved.
         for (const job of reviewJobs) records.delete(job.key);
         const definitive = reviewed.records.filter((record) => !isReview(record));

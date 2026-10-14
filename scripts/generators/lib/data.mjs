@@ -157,15 +157,21 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
       // Only correctly aligned records can enter review. The definitive review
       // pass and database validation remain strict: repair is first-pass only.
       if (task === 'respell') {
-        // Check the input lock before repair so a changed or malformed supplied
-        // IPA cannot be treated as a newly generated pronunciation.
-        if (job.transcription !== null && (record.transcription !== job.transcription || record.transcriptionStatus !== 'ready')) {
-          reason = 'Supplied IPA must be preserved exactly and remain ready';
-        } else {
-          if (reviewInvalidValues) record = repairRespellingRecord(record, source, target);
-          try { validateRespellingRecord(record, job, target); }
-          catch (error) { reason = error.message; }
+        if (job.transcription !== null) {
+          const changed = record.transcription !== job.transcription || record.transcriptionStatus !== 'ready';
+          // Supplied IPA is owned by the caller, never by either model pass.
+          record = { ...record, transcription: job.transcription, transcriptionStatus: 'ready' };
+          if (reviewInvalidValues && changed && typeof record.note === 'string' && record.note.length <= 500 &&
+              ['ready', 'review'].includes(record.respellingStatus)) {
+            // A guide generated against a different IPA must be reassessed.
+            const note = `Use authoritative input IPA ${JSON.stringify(job.transcription)}; the returned IPA or its status was ignored. Reassess the guide against the input IPA.`;
+            record = { ...record, respellingStatus: 'review',
+              note: [note, record.note].filter(Boolean).join(' ').slice(0, 500) };
+          }
         }
+        if (reviewInvalidValues) record = repairRespellingRecord(record, source, target);
+        try { validateRespellingRecord(record, job, target); }
+        catch (error) { reason = error.message; }
       } else {
         if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
             typeof record.note === 'string' && record.note.length <= 500 &&

@@ -110,14 +110,20 @@ unchanged. Runs stop when all eligible selections have been scanned or the
 spending threshold is reached. Generated results are
 checked against the input words and the allowed pronunciation characters.
 Items flagged for review receive a separate automated editing pass before
-being finalized. In transcription generation, words that still fail review
-validation are logged and skipped; valid words in the batch are saved and the
-scan continues. Skipped words remain eligible for a later run. Respelling
+being finalized. In both generators, items that still fail review validation
+are logged and skipped; valid items in the batch are saved and the scan
+continues. Skipped items remain eligible for a later run. Respelling
 records use `transcription` and `respelling` fields,
 with separate `transcriptionStatus` and `respellingStatus` review decisions.
-The reviewer preserves accepted IPA; when newly generated IPA needs
-review, it finalizes the IPA first and regenerates the guide to match. Both
-fields must be valid and ready before either is saved. Entries with multiple
+Supplied IPA is taken directly from the input in both passes, regardless of
+the model's returned IPA. If the first pass changes supplied IPA or flags it
+for review, only the guide is sent for review against the original IPA.
+When newly generated IPA needs review, the reviewer finalizes it first and
+regenerates the guide to match; accepted new IPA stays locked during guide
+review. Invalid first-pass characters or formatting add diagnostic notes and
+flag the affected field for review; invalid new IPA flags both fields.
+Both fields must be valid and ready before either is saved. A rejected pair
+saves neither component. Entries with multiple
 IPA readings contribute a separate item for each reading missing a guide.
 Generation and review prompts live in
 [`scripts/generators/prompts/`](scripts/generators/prompts/).

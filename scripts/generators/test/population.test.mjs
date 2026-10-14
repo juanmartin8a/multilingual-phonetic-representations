@@ -1405,13 +1405,94 @@ test('mixed IPA jobs finalize uncertain pairs and preserve accepted readings in 
   }
 });
 
-test('combined validation rejects changed supplied IPA and malformed records without sending them to review', () => {
+test('combined validation takes supplied IPA from input and reviews guides when the model changes it', () => {
+  const job = { key: 'locked', word: 'read', transcription: '/riːd/' };
+  const original = modelRespellingRow({ ...job, index: 0 }, 'rid');
+  for (const transcription of ['/rɛd/', '/ḫ/', null]) for (const transcriptionStatus of ['ready', 'review', 'unknown']) {
+    const output = { records: [{ ...original, transcription, transcriptionStatus }] };
+    const first = validateOrderedRecords(output, [job], 'respell', target, { reviewInvalidValues: true, source });
+    assert.deepEqual(first.rejected, []);
+    assert.equal(first.records[0].transcription, '/riːd/');
+    assert.equal(first.records[0].transcriptionStatus, 'ready');
+    assert.equal(first.records[0].respellingStatus, 'review');
+    assert.match(first.records[0].note, /authoritative input IPA/);
+    const final = validateOrderedRecords(output, [job], 'respell', target);
+    assert.deepEqual(final.rejected, []);
+    assert.equal(final.records[0].transcription, '/riːd/');
+    assert.equal(final.records[0].transcriptionStatus, 'ready');
+    assert.equal(final.records[0].respellingStatus, 'ready');
+  }
+});
+
+test('respelling review saves valid pairs, continues scanning and retries rejected pairs in both modes and APIs', async () => {
+  for (const api of ['responses', 'chat']) for (const write of [false, true]) {
+    const cfg = fixture({ api, write, batchSize: 5, batchSizeMultiplicity: 2 });
+    const db = fakeDatabase(['1', '2', '3', '4', '5', '6'].map((id) => entry(id, 'en',
+      id === '4' ? [{ id: 'existing', transcription: '/a/', targets: [] }] : [])));
+    const requests = [], logs = [];
+    let retry = false;
+    const dependencies = { log: (text) => logs.push(text), fetchFn: async (url, options) => {
+      const body = JSON.parse(options.body);
+      const input = JSON.parse(api === 'responses' ? body.input[1].content : body.messages[1].content);
+      requests.push(input.words);
+      const reviewing = input.words[0].note !== undefined;
+      if (reviewing) {
+        assert.deepEqual(input.words.map((j) => [j.word, j.transcription]),
+          [['word-1', null], ['word-2', '/a/'], ['word-3', null], ['word-4', '/a/']]);
+        assert.deepEqual(input.words.map((j) => [j.candidate.transcriptionStatus, j.candidate.respellingStatus]),
+          [['review', 'review'], ['ready', 'review'], ['review', 'review'], ['ready', 'review']]);
+        assert.match(input.words[0].note, /U\+1E2B/);
+        assert.match(input.words[1].note, /target language es/);
+        assert.match(input.words[2].note, /source language en.*target language es/);
+        assert.match(input.words[3].note, /authoritative input IPA/);
+        assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [0, 0, 0, 1, 0, 0]);
+      }
+      const records = input.words.map((j) => {
+        const record = { ...modelRespellingRow(j, 'a'), transcription: '/a/' };
+        if (retry) return record;
+        if (j.word === 'word-1') return { ...record, transcription: '/ḫ/' };
+        if (j.word === 'word-2') return { ...record, respelling: 'həloʊ' };
+        if (j.word === 'word-3' && !reviewing) return { ...record, transcription: '/ḫ/', respelling: 'həloʊ' };
+        if (j.word === 'word-4') return { ...record, transcription: reviewing ? null : '/b/' };
+        return record;
+      });
+      return Response.json(api === 'responses' ? answer(records) : {
+        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({ records }) } }],
+        usage: { prompt_tokens: 2000, completion_tokens: 500,
+          prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      });
+    } };
+    await populate('respellings', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 3);
+    assert.deepEqual(requests[2].map((j) => j.word), ['word-6']);
+    assert.ok(logs.some((text) => text.includes('respell review: skipped "word-1": Invalid transcription value')));
+    assert.ok(logs.some((text) => text.includes('respell review: skipped "word-2": Invalid respelling value')));
+    if (write) {
+      assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [0, 0, 1, 1, 1, 1]);
+      assert.ok(db.entries.slice(2).every((e) => e.transcriptions[0].transcription === '/a/' &&
+        e.transcriptions[0].targets.includes('es')));
+      assert.equal(db.entries[3].transcriptions[0].id, 'existing');
+      assert.deepEqual(readdirSync(cfg.stateDir), []);
+    } else {
+      const saved = readdirSync(join(cfg.stateDir, 'results')).map((f) => readJson(join(cfg.stateDir, 'results', f)));
+      assert.deepEqual(saved.map((item) => item.job.word).sort(), ['word-3', 'word-4', 'word-5', 'word-6']);
+      assert.ok(saved.every((item) => item.transcription === '/a/' && item.respelling === 'a'));
+      assert.deepEqual(db.entries.map((e) => e.transcriptions.length), [0, 0, 0, 1, 0, 0]);
+    }
+    retry = true;
+    await populate('respellings', cfg, db, createAI(cfg, dependencies), { select: () => 0, log: () => {} });
+    assert.equal(requests.length, 4);
+    assert.deepEqual(requests[3].map((j) => j.word), ['word-1', 'word-2']);
+    if (write) assert.ok(db.entries.every((e) => e.transcriptions[0].targets.includes('es')));
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 6);
+  }
+});
+
+test('combined validation rejects malformed records before review', () => {
   const jobs = [{ key: 'locked', word: 'read', transcription: '/riːd/' },
     { key: 'new', word: 'é', transcription: null }];
   const rows = jobs.map((j, index) => modelRespellingRow({ ...j, index }));
   for (const bad of [
-    { ...rows[0], transcription: '/rɛd/' }, { ...rows[0], transcription: null },
-    { ...rows[0], transcriptionStatus: 'review', note: 'Change reading' },
     { ...rows[0], respellingStatus: 'unknown' }, { ...rows[0], word: 'wrong' },
     { ...rows[0], index: 1 }, { ...rows[0], extra: 'ignored?' },
     { ...rows[0], note: 'x'.repeat(501) }, { ...rows[0], note: 'Unexplained ready note' },
@@ -1430,7 +1511,7 @@ test('combined validation rejects changed supplied IPA and malformed records wit
     respellingStatus: 'ready', note: 'IPA uncertain' }, jobs[1], target), /Uncertain IPA/);
 });
 
-test('review cannot change existing or accepted newly generated IPA, and failed pairs save neither component', async () => {
+test('review uses input IPA regardless of returned IPA for existing and accepted new readings', async () => {
   for (const write of [false, true]) for (const existing of [false, true]) {
     const cfg = fixture({ write });
     const db = fakeDatabase([entry('1', 'en', existing ? [{ id: 'old', transcription: '/a/', targets: [] }] : [])]);
@@ -1443,11 +1524,19 @@ test('review cannot change existing or accepted newly generated IPA, and failed 
         { ...modelRespellingRow(j), transcription: '/b/' });
       return Response.json(answer(records));
     } });
-    await assert.rejects(populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} }), /review pass rejected/);
+    await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
     assert.equal(calls, 2);
-    assert.equal(db.calls.ipa, 0);
-    assert.equal(db.calls.respell, 0);
-    assert.deepEqual(readdirSync(cfg.stateDir), []);
+    if (write) {
+      assert.equal(db.calls.ipa, existing ? 0 : 1);
+      assert.equal(db.calls.respell, 1);
+      assert.equal(db.entries[0].transcriptions[0].transcription, '/a/');
+      assert.deepEqual(db.entries[0].transcriptions[0].targets, ['es']);
+      assert.deepEqual(readdirSync(cfg.stateDir), []);
+    } else {
+      const saved = readdirSync(join(cfg.stateDir, 'results')).map((f) => readJson(join(cfg.stateDir, 'results', f)));
+      assert.equal(saved.length, 1);
+      assert.equal(saved[0].transcription, '/a/');
+    }
   }
 });
 
@@ -1471,7 +1560,7 @@ test('failed combined review must be definitive, aligned and valid before saving
         { ...modelRespellingRow(j), transcriptionStatus: 'review', respellingStatus: 'review', note: 'Resolve reading' } :
         transform(modelRespellingRow(j)))));
     } });
-    await assert.rejects(populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} }), /review pass rejected/);
+    await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
     assert.equal(db.calls.ipa, 0);
     assert.equal(db.calls.respell, 0);
     assert.deepEqual(readdirSync(cfg.stateDir), []);
