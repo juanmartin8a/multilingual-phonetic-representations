@@ -27,14 +27,19 @@ export function languagePolicy(language, overrides = {}) {
   return policy;
 }
 
-export function choosePair(languages, randomInt) {
+export function choosePair(languages, randomInt, completed = new Map()) {
   if (new Set(languages.map((l) => l.language_code)).size !== languages.length) {
     throw new Error('Duplicate language codes; fix the database before selecting a pair');
   }
-  const sources = languages.filter((l) => l.hasEntries && languages.some((t) => t.language_code !== l.language_code));
-  if (!sources.length) throw new Error('Need at least two distinct languages and a source containing entries');
+  const targetsFor = (source) => languages.filter((target) => target.language_code !== source.language_code &&
+    !completed.get(source.language_code)?.has(target.language_code));
+  const sources = languages.filter((l) => l.hasEntries && targetsFor(l).length);
+  if (!sources.length) {
+    if (completed.size) return null;
+    throw new Error('Need at least two distinct languages and a source containing entries');
+  }
   const source = sources[randomInt(sources.length)];
-  const targets = languages.filter((l) => l.language_code !== source.language_code);
+  const targets = targetsFor(source);
   return { source, target: targets[randomInt(targets.length)] };
 }
 
@@ -152,15 +157,22 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
       // Only correctly aligned records can enter review. The definitive review
       // pass and database validation remain strict: repair is first-pass only.
       if (task === 'respell') {
-        // Check the input lock before repair so a changed or malformed supplied
-        // IPA cannot be treated as a newly generated pronunciation.
-        if (job.transcription !== null && (record.transcription !== job.transcription || record.transcriptionStatus !== 'ready')) {
-          reason = 'Supplied IPA must be preserved exactly and remain ready';
-        } else {
-          if (reviewInvalidValues) record = repairRespellingRecord(record, source, target);
-          try { validateRespellingRecord(record, job, target); }
-          catch (error) { reason = error.message; }
+        if (job.transcription !== null && reviewInvalidValues) {
+          const changed = record.transcription !== job.transcription || record.transcriptionStatus !== 'ready';
+          // First-pass mismatches trigger guide review; final review must
+          // preserve the input IPA exactly or the pair is rejected below.
+          record = { ...record, transcription: job.transcription, transcriptionStatus: 'ready' };
+          if (changed && typeof record.note === 'string' && record.note.length <= 500 &&
+              ['ready', 'review'].includes(record.respellingStatus)) {
+            // A guide generated against a different IPA must be reassessed.
+            const note = `Use authoritative input IPA ${JSON.stringify(job.transcription)}; the returned IPA or its status was ignored. Reassess the guide against the input IPA.`;
+            record = { ...record, respellingStatus: 'review',
+              note: [note, record.note].filter(Boolean).join(' ').slice(0, 500) };
+          }
         }
+        if (reviewInvalidValues) record = repairRespellingRecord(record, source, target);
+        try { validateRespellingRecord(record, job, target); }
+        catch (error) { reason = error.message; }
       } else {
         if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
             typeof record.note === 'string' && record.note.length <= 500 &&

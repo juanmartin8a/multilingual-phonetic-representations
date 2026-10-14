@@ -1,7 +1,5 @@
-import { resolve } from 'node:path';
 import { randomInt } from 'node:crypto';
 import { configuration, help } from './config.mjs';
-import { atomicJson, readJson } from '../../utils/files.mjs';
 import { choosePair, languagePolicy, pronunciationKey } from './data.mjs';
 import { connect } from './db.mjs';
 import { createAI } from './ai.mjs';
@@ -85,28 +83,28 @@ async function processBatch(cfg, db, ai, entries, source, target, log) {
 export async function populate(task, cfg, db, ai, { log = console.log, select = randomInt } = {}) {
   const languages = (await db.languages()).sort((a, b) => a.language_code.localeCompare(b.language_code));
   if (new Set(languages.map((l) => l.language_code)).size !== languages.length) throw new Error('Duplicate language codes');
-  let target = null, selected;
-  if (task === 'respellings') {
-    const pairPath = resolve(cfg.stateDir, 'respelling-pair.json');
-    const saved = readJson(pairPath);
-    selected = saved ? { source: languages.find((l) => l.language_code === saved.source),
-      target: languages.find((l) => l.language_code === saved.target) } : choosePair(languages, select);
-    if (!selected.source || !selected.target || selected.source.language_code === selected.target.language_code) {
-      throw new Error('Saved language pair no longer exists');
-    }
-    cfg.targetId = selected.target.id;
-    target = languagePolicy(selected.target, cfg.languagePolicies);
-    if (!target.script) throw new Error(`Configure a native script policy for target ${target.code}`);
-    if (!cfg.write && !saved) atomicJson(pairPath,
-      { source: selected.source.language_code, target: selected.target.language_code });
-    log(`Language pair: ${selected.source.language_code} -> ${target.code}`);
-  }
-  const ordered = selected ? [selected.source] : languages.filter((l) => l.hasEntries);
+  const remaining = languages.filter((l) => l.hasEntries);
+  const completedPairs = new Map();
   const windowSize = cfg.batchSize * cfg.batchSizeMultiplicity;
   function stopForBudget() {
     log(`Budget reached: $${(ai.totals().committed / 1e9).toFixed(6)} committed this run; $${(cfg.budget / 1e9).toFixed(6)} limit. Completed batches ${cfg.write ? 'inserted' : 'saved locally'}; rerun for a fresh budget.`);
   }
-  for (const language of ordered) {
+  while (true) {
+    if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
+    let language, target = null;
+    if (task === 'respellings') {
+      const selected = choosePair(languages, select, completedPairs);
+      if (!selected) break;
+      language = selected.source;
+      cfg.targetId = selected.target.id;
+      target = languagePolicy(selected.target, cfg.languagePolicies);
+      if (!target.script) throw new Error(`Configure a native script policy for target ${target.code}`);
+      log(`Language pair: ${language.language_code} -> ${target.code}`);
+    } else {
+      if (!remaining.length) break;
+      [language] = remaining.splice(select(remaining.length), 1);
+      log(`Language: ${language.language_code}`);
+    }
     let after = null;
     while (true) {
       if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
@@ -127,6 +125,10 @@ export async function populate(task, cfg, db, ai, { log = console.log, select = 
         if (ai.totals().committed >= cfg.budget) { stopForBudget(); return; }
       }
       if (pending.length < windowSize) break;
+    }
+    if (target) {
+      if (!completedPairs.has(language.language_code)) completedPairs.set(language.language_code, new Set());
+      completedPairs.get(language.language_code).add(target.code);
     }
   }
   log(`Scan complete. Finalized results ${cfg.write ? 'inserted into the database' : 'saved locally'}. Rerun to retry skipped items.`);

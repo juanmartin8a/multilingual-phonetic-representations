@@ -189,7 +189,7 @@ test('population repairs both missing IPA and respellings before their database 
         review && failedTask !== 'respell' ? 'al ujrá' : 'həloʊ')), 'responses');
     } });
     if (failedTask) {
-      await assert.rejects(populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 }), /review pass rejected/);
+      await populate('respellings', cfg, db, ai, { log: () => {}, select: () => 0 });
       assert.deepEqual(stages, ['pair-first', 'pair-review']);
       assert.deepEqual(e.transcriptions, []);
     } else {

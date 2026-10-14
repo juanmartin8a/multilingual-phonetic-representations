@@ -108,14 +108,24 @@ export function createAI(cfg, dependencies = {}) {
         return { ...job, transcription: record.transcriptionStatus === 'ready' ? record.transcription : null,
           note, candidate };
       });
+      let reviewCount = 0;
       for (let reviewOffset = 0; reviewOffset < flagged.length;) {
         const { batch: reviewJobs, body: reviewBody } = nextBatch(flagged, reviewOffset, reviewPrompt, {}, reviewSchema);
         const response = await gateway.request(reviewBody);
         const reviewed = validateOrderedRecords(JSON.parse(outputText(response, cfg.api)), reviewJobs, task, target);
-        if (reviewed.rejected.length || reviewed.records.some(isReview)) {
-          throw new Error(`${task} review pass rejected: every reviewed word must have a valid definitive value`);
+        // Remove first-pass candidates so rejected reviews cannot be saved.
+        for (const job of reviewJobs) records.delete(job.key);
+        const definitive = reviewed.records.filter((record) => !isReview(record));
+        const rejected = [...reviewed.rejected, ...reviewed.records.filter(isReview).map((record) => ({
+          job: reviewJobs.find((job) => job.key === record.key),
+          reason: 'Review output must be definitive and ready', returned: record,
+        }))];
+        if (rejected.length) log(`${task} review: ${rejected.length} invalid items skipped; rerun to retry`);
+        for (const { job, reason, returned } of rejected) {
+          log(`${task} review: skipped ${JSON.stringify(job.word)}: ${reason}; returned ${JSON.stringify(returned)}`);
         }
-        for (const record of reviewed.records) records.set(record.key, record);
+        for (const record of definitive) records.set(record.key, record);
+        reviewCount += definitive.length;
         reviewOffset += reviewJobs.length;
       }
       const ready = [...records.values()];
@@ -126,7 +136,7 @@ export function createAI(cfg, dependencies = {}) {
           ...(combined ? { transcription: record.transcription, respelling: record.respelling } : { value: record.value }) });
       }
       await emit(ready);
-      log(`${task}: ${ready.length} finalized${flagged.length ? ` (${flagged.length} reviewed)` : ''}`);
+      log(`${task}: ${ready.length} finalized${flagged.length ? ` (${reviewCount} reviewed)` : ''}`);
       offset += batch.length;
     }
     return results;

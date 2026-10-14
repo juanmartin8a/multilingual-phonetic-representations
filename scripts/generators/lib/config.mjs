@@ -15,7 +15,7 @@ export const help = (task) => `Usage: bun [--env-file=.env.local] scripts/genera
   --provider NAME     Only openai (provider-native AI Gateway)
   --batch-size N      Usable words per processing batch / items per AI call, 1-1000; default 20
   --batch-size-multiplicity N  Retrieve batch size × N usable words at a time; default 1, explicit integer N > 1
-  --state-dir PATH    Local results/pair; default <script-dir>/.state
+  --state-dir PATH    Local finalized results; default <script-dir>/.state
   --help              This help
 See README.md and scripts/generators/config/${task}.yml. Environment variables supply Turso connection settings and credentials.
 The database target comes from TURSO_DATABASE_URL.`;

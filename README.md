@@ -91,27 +91,40 @@ There are two generators, written for Bun and using OpenAI through Cloudflare
 AI Gateway:
 
 - [`populate-transcriptions.mjs`](scripts/generators/populate-transcriptions.mjs)
-  adds IPA pronunciations to words that do not have one yet. It works across
-  all languages with entries and follows language-specific settings for dialect
-  choices.
+  adds IPA pronunciations to words that do not have one yet. It randomly
+  chooses a language with entries and follows its dialect settings.
 - [`populate-respellings.mjs`](scripts/generators/populate-respellings.mjs)
   adds pronunciation guides for speakers of another language, using that
   language's native writing system. It covers each IPA variant missing a guide
   for the chosen target language. Each generation record contains IPA and its
   respelling together: existing IPA is preserved exactly; missing IPA is
   generated first within the same response, then used to derive the guide. It
-  reuses a saved source/target language pair when available; otherwise, it randomly
-  chooses a source language with entries and a different target language.
-  Local runs save that choice for later runs.
+  randomly chooses a source language with entries and a different target
+  language.
 
-Both scripts work through missing data in batches. Generated results are
+Both scripts work through missing data in batches. After finishing a language
+or source/target pair, they randomly choose another one that has not been
+scanned in this run. Empty selections are skipped. Each language or pair is
+scanned at most once per run, including in local mode where the database is
+unchanged. Runs stop when all eligible selections have been scanned or the
+spending threshold is reached. Generated results are
 checked against the input words and the allowed pronunciation characters.
 Items flagged for review receive a separate automated editing pass before
-being finalized. Respelling records use `transcription` and `respelling` fields,
+being finalized. In both generators, items that still fail review validation
+are logged and skipped; valid items in the batch are saved and the scan
+continues. Skipped items remain eligible for a later run. Respelling
+records use `transcription` and `respelling` fields,
 with separate `transcriptionStatus` and `respellingStatus` review decisions.
-The reviewer preserves accepted IPA; when newly generated IPA needs
-review, it finalizes the IPA first and regenerates the guide to match. Both
-fields must be valid and ready before either is saved. Entries with multiple
+Supplied IPA always remains authoritative. If the first pass changes it or flags it
+for review, only the guide is sent for review against the original IPA.
+If final review returns different IPA, the pair is rejected and existing IPA
+is left untouched; valid pairs in the batch are still saved.
+When newly generated IPA needs review, the reviewer finalizes it first and
+regenerates the guide to match; accepted new IPA stays locked during guide
+review. Invalid first-pass characters or formatting add diagnostic notes and
+flag the affected field for review; invalid new IPA flags both fields.
+Both fields must be valid and ready before either is saved. A rejected pair
+saves neither component. Entries with multiple
 IPA readings contribute a separate item for each reading missing a guide.
 Generation and review prompts live in
 [`scripts/generators/prompts/`](scripts/generators/prompts/).
