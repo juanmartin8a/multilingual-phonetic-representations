@@ -129,7 +129,7 @@ function fakeDatabase(entries) {
       for (const row of rows) {
         const ipa = entries.flatMap((e) => e.transcriptions).find((t) => t.id === row.phonetic_transcription_id);
         assert.ok(ipa, 'Respelling must reference a real IPA database ID');
-        if (!ipa.targets.includes('es')) ipa.targets.push('es');
+        if (!ipa.targets.includes(row.target_language_code)) ipa.targets.push(row.target_language_code);
       }
     },
   };
@@ -349,6 +349,10 @@ test('random pair has a populated source and distinct target; duplicate codes fa
   assert.equal(pair.target.language_code, 'en');
   assert.throws(() => choosePair([languages[0]], () => 0));
   assert.throws(() => choosePair([languages[0], languages[0]], () => 0));
+  const completed = new Map([['en', new Set(['es'])]]);
+  assert.equal(choosePair(languages, () => 0, completed).source.language_code, 'es');
+  completed.set('es', new Set(['en']));
+  assert.equal(choosePair(languages, () => 0, completed), null);
 });
 
 test('a refused/incomplete response cannot become a database result', () => {
@@ -504,18 +508,30 @@ test('missing usage stops before result caching', async () => {
 
 });
 
-test('IPA population covers all languages and preserves existing variants', async () => {
-  const cfg = fixture({ write: true });
-  const db = fakeDatabase([entry('1'), entry('2', 'en', [{ id: 'old', transcription: '/old/', targets: [] }]), entry('3', 'es')]);
-  const count = { calls: 0 };
-  const ai = createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} });
-  await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(db.entries[1].transcriptions[0].transcription, '/old/');
-  assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
-  assert.equal(count.calls, 2);
-  await populate('transcriptions', cfg, db, ai, { log: () => {} });
-  assert.equal(count.calls, 2);
-  assert.equal(db.entries[1].transcriptions.length, 1);
+test('IPA population visits all languages in random order and preserves existing variants', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase([entry('1'), entry('2', 'en', [{ id: 'old', transcription: '/old/', targets: [] }]), entry('3', 'es')]);
+    const count = { calls: 0 }, requests = [], bounds = [];
+    const fetcher = fakeFetch(count);
+    const dependencies = { log: () => {}, fetchFn: (url, options) => {
+      requests.push(JSON.parse(JSON.parse(options.body).input[1].content).source.code);
+      return fetcher(url, options);
+    } };
+    await populate('transcriptions', cfg, db, createAI(cfg, dependencies), {
+      log: () => {}, select: (n) => { bounds.push(n); return n - 1; },
+    });
+    assert.deepEqual(bounds, [2, 1]);
+    assert.deepEqual(requests, ['es', 'en']);
+    assert.equal(db.entries[1].transcriptions[0].transcription, '/old/');
+    assert.equal(count.calls, 2);
+    if (write) assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+    await populate('transcriptions', cfg, db, createAI(cfg, {
+      log: () => {}, fetchFn: () => { throw new Error('Unexpected repeat generation'); },
+    }), { log: () => {}, select: () => 0 });
+    assert.equal(count.calls, 2);
+    assert.equal(db.entries[1].transcriptions.length, 1);
+  }
 });
 
 test('both scripts finalize reviews before writing and skip inserted results on restart', async () => {
@@ -697,7 +713,7 @@ function snapshot(directory) {
   }));
 }
 
-test('default mode saves only finalized values and the minimal respelling pair', async () => {
+test('default mode saves only finalized values and reuses matching cached results', async () => {
   for (const task of ['transcriptions', 'respellings']) {
     const cfg = fixture();
     const db = fakeDatabase([entry('1')]);
@@ -707,7 +723,7 @@ test('default mode saves only finalized values and the minimal respelling pair',
     await populate(task, cfg, db, ai, { select: () => 0, log: () => {} });
     assert.equal(db.calls.ipa, 0);
     assert.equal(db.calls.respell, 0);
-    assert.deepEqual(readdirSync(cfg.stateDir).sort(), task === 'transcriptions' ? ['results'] : ['respelling-pair.json', 'results']);
+    assert.deepEqual(readdirSync(cfg.stateDir).sort(), ['results']);
     const files = readdirSync(join(cfg.stateDir, 'results'));
     assert.equal(files.length, 1);
     for (const file of files) {
@@ -720,11 +736,10 @@ test('default mode saves only finalized values and the minimal respelling pair',
       assert.equal(item.job.word, 'word-1');
       assert.ok(typeof (item.task === 'ipa' ? item.value : item.respelling) === 'string');
     }
-    if (task === 'respellings') assert.deepEqual(readJson(join(cfg.stateDir, 'respelling-pair.json')), { source: 'en', target: 'es' });
     assertNoCredentials(cfg);
     const before = snapshot(cfg.stateDir);
     await populate(task, cfg, db, createAI(cfg, { log: () => {}, fetchFn: () => { throw new Error('Cache must be reused'); } }),
-      { select: () => { throw new Error('Pair must be reused'); }, log: () => {} });
+      { select: () => 0, log: () => {} });
     assert.deepEqual(snapshot(cfg.stateDir), before);
   }
 });
@@ -743,7 +758,7 @@ test('write mode creates no state directory for either script', async () => {
   }
 });
 
-test('write mode reads existing local results and pair without modifying any files', async () => {
+test('write mode reads matching local results without modifying any files', async () => {
   const cfg = fixture();
   const db = fakeDatabase([entry('1'), entry('2', 'en', [
     { id: 'old-1', transcription: '/a/', targets: ['es'] },
@@ -756,7 +771,7 @@ test('write mode reads existing local results and pair without modifying any fil
   const before = snapshot(cfg.stateDir);
   const writing = { ...cfg, write: true };
   const ai = createAI(writing, { log: () => {}, fetchFn: () => { throw new Error('No paid regeneration'); } });
-  await populate('respellings', writing, db, ai, { log: () => {}, select: () => { throw new Error('Must reuse saved pair'); } });
+  await populate('respellings', writing, db, ai, { log: () => {}, select: () => 0 });
   assert.equal(ai.totals().committed, 0);
   assert.ok(db.entries.flatMap((e) => e.transcriptions).every((ipa) => ipa.targets.includes('es')));
   assert.deepEqual(snapshot(cfg.stateDir), before);
@@ -1044,12 +1059,14 @@ test('multiplicity 3 repeatedly retrieves 300 usable words and processes batches
   }
 });
 
-test('retrieval continues across source languages and multiple variants share one processing batch', async () => {
+test('retrieval finishes the selected language before switching and multiple variants share one processing batch', async () => {
   const cfg = fixture({ write: true, batchSize: 2, batchSizeMultiplicity: 2 });
   const db = fakeDatabase([entry('1'), entry('2', 'es'), entry('3', 'es'), entry('4', 'es'), entry('5', 'es')]);
   const count = { calls: 0 };
-  await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count) }), { log: () => {} });
+  await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count) }),
+    { log: () => {}, select: (n) => n - 1 });
   assert.ok(db.entries.every((e) => e.transcriptions.length === 1));
+  assert.equal(db.calls.reads, 3);
 
   const respellingCfg = fixture({ write: true, batchSize: 1 });
   const variants = fakeDatabase([entry('1', 'en', [
@@ -1176,16 +1193,85 @@ test('failed processing releases the batch scope and budget checks still apply',
   assert.equal(count.calls, 1);
 });
 
-test('invalid saved language pairs stop before generation or insertion', async () => {
-  for (const pair of [{ source: 'en', target: 'en' }, { source: 'missing', target: 'es' }, { source: 'en', target: 'missing' }]) {
-    const cfg = fixture({ write: true });
-    writeFileSync(join(cfg.stateDir, 'respelling-pair.json'), JSON.stringify(pair));
-    const db = fakeDatabase([entry('1')]);
-    const count = { calls: 0 };
-    await assert.rejects(populate('respellings', cfg, db,
-      createAI(cfg, { fetchFn: fakeFetch(count), log: () => {} }), { log: () => {}, select: () => 0 }), /Saved language pair/);
-    assert.equal(count.calls, 0);
-    assert.deepEqual(db.calls, { reads: 0, refreshes: 0, ipa: 0, respell: 0 });
+test('respellings choose a fresh pair in both modes despite legacy saved selections', async () => {
+  for (const write of [false, true]) {
+    const cfg = fixture({ write });
+    const pairPath = join(cfg.stateDir, 'respelling-pair.json');
+    const saved = JSON.stringify({ source: 'missing', target: 'missing' });
+    writeFileSync(pairPath, saved);
+    const db = fakeDatabase([entry('1'), entry('2', 'es')]);
+    const requests = [], bounds = [];
+    const fetcher = fakeFetch({ calls: 0 }, (rows) => answer(rows.map((r) => ({ ...r, respelling: 'a' }))));
+    const dependencies = { log: () => {}, fetchFn: (url, options) => {
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      requests.push([input.source.code, input.target.code]);
+      return fetcher(url, options);
+    } };
+    for (const sourceIndex of [0, 1]) {
+      let selections = 0;
+      await populate('respellings', cfg, db, createAI(cfg, dependencies), {
+        log: () => {}, select: (n) => { bounds.push(n); return selections++ === 0 ? sourceIndex : 0; },
+      });
+    }
+    assert.deepEqual(bounds, [2, 1, 1, 1, 2, 1, 1, 1]);
+    assert.deepEqual(requests, [['en', 'es'], ['es', 'en']]);
+    if (write) {
+      assert.deepEqual(db.entries[0].transcriptions[0].targets, ['es']);
+      assert.deepEqual(db.entries[1].transcriptions[0].targets, ['en']);
+    }
+    assert.equal(readFileSync(pairPath, 'utf8'), saved);
+  }
+});
+
+test('IPA selection uses only languages with entries and handles an empty database', async () => {
+  for (const write of [false, true]) for (const entries of [[], [entry('1', 'es')]]) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase(entries);
+    const bounds = [], logs = [];
+    await populate('transcriptions', cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch({ calls: 0 }) }), {
+      log: (message) => logs.push(message), select: (n) => { bounds.push(n); return 0; },
+    });
+    assert.deepEqual(bounds, entries.length ? [1] : []);
+    assert.equal(db.calls.reads, entries.length);
+    if (entries.length) assert.ok(logs.includes('Language: es'));
+  }
+});
+
+test('both scripts move past exhausted selections without revisiting them in either mode', async () => {
+  for (const write of [false, true]) for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write });
+    const db = fakeDatabase([
+      entry('1', 'en', [{ id: 'complete', transcription: '/a/', targets: ['es'] }]),
+      entry('2', 'es'),
+    ]);
+    const requests = [], logs = [];
+    const fetcher = fakeFetch({ calls: 0 }, (rows) => answer(rows.map((r) =>
+      Object.hasOwn(r, 'respelling') ? { ...r, respelling: 'a' } : r)));
+    await populate(task, cfg, db, createAI(cfg, { log: () => {}, fetchFn: (url, options) => {
+      const input = JSON.parse(JSON.parse(options.body).input[1].content);
+      requests.push([input.source.code, input.target?.code]);
+      return fetcher(url, options);
+    } }), { log: (message) => logs.push(message), select: () => 0 });
+    assert.deepEqual(requests, [['es', task === 'respellings' ? 'en' : undefined]]);
+    assert.equal(db.calls.reads, 2);
+    assert.equal(logs.filter((message) => message.startsWith('Language')).length, 2);
+    assert.ok(logs.at(-1).startsWith('Scan complete.'));
+  }
+});
+
+test('budget exhaustion stops rotation before selecting another language or pair', async () => {
+  for (const write of [false, true]) for (const task of ['transcriptions', 'respellings']) {
+    const cfg = fixture({ write, budget: 1 });
+    const db = fakeDatabase([entry('1'), entry('2', 'es')]);
+    const bounds = [], logs = [], count = { calls: 0 };
+    await populate(task, cfg, db, createAI(cfg, { log: () => {}, fetchFn: fakeFetch(count) }), {
+      log: (message) => logs.push(message), select: (n) => { bounds.push(n); return 0; },
+    });
+    assert.deepEqual(bounds, task === 'respellings' ? [2, 1] : [2]);
+    assert.equal(count.calls, 1);
+    assert.equal(db.calls.reads, 1);
+    assert.equal(db.entries[1].transcriptions.length, 0);
+    assert.ok(logs.at(-1).startsWith('Budget reached:'));
   }
 });
 
@@ -1314,7 +1400,7 @@ test('review cannot change existing or accepted newly generated IPA, and failed 
     assert.equal(calls, 2);
     assert.equal(db.calls.ipa, 0);
     assert.equal(db.calls.respell, 0);
-    assert.deepEqual(readdirSync(cfg.stateDir), write ? [] : ['respelling-pair.json']);
+    assert.deepEqual(readdirSync(cfg.stateDir), []);
   }
 });
 
@@ -1341,7 +1427,7 @@ test('failed combined review must be definitive, aligned and valid before saving
     await assert.rejects(populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} }), /review pass rejected/);
     assert.equal(db.calls.ipa, 0);
     assert.equal(db.calls.respell, 0);
-    assert.deepEqual(readdirSync(cfg.stateDir), write ? [] : ['respelling-pair.json']);
+    assert.deepEqual(readdirSync(cfg.stateDir), []);
   }
 });
 

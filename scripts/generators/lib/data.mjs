@@ -27,14 +27,19 @@ export function languagePolicy(language, overrides = {}) {
   return policy;
 }
 
-export function choosePair(languages, randomInt) {
+export function choosePair(languages, randomInt, completed = new Map()) {
   if (new Set(languages.map((l) => l.language_code)).size !== languages.length) {
     throw new Error('Duplicate language codes; fix the database before selecting a pair');
   }
-  const sources = languages.filter((l) => l.hasEntries && languages.some((t) => t.language_code !== l.language_code));
-  if (!sources.length) throw new Error('Need at least two distinct languages and a source containing entries');
+  const targetsFor = (source) => languages.filter((target) => target.language_code !== source.language_code &&
+    !completed.get(source.language_code)?.has(target.language_code));
+  const sources = languages.filter((l) => l.hasEntries && targetsFor(l).length);
+  if (!sources.length) {
+    if (completed.size) return null;
+    throw new Error('Need at least two distinct languages and a source containing entries');
+  }
   const source = sources[randomInt(sources.length)];
-  const targets = languages.filter((l) => l.language_code !== source.language_code);
+  const targets = targetsFor(source);
   return { source, target: targets[randomInt(targets.length)] };
 }
 

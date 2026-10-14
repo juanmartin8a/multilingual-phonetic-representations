@@ -3,7 +3,7 @@
 # Usable words per processing batch and maximum items per AI call: 1-1000.
 batchSize: 100
 # Paths in YAML are relative to this file. The default state directory is
-# <script-dir>/.state; only finalized results and the respelling pair are saved.
+# <script-dir>/.state; only finalized results are saved.
 # stateDir: ../.state
 # Retrieve batchSize × multiplicity usable words, process in batchSize batches, and repeat.
 # batchSizeMultiplicity: 2  # Omit for 1; explicit values must be integers greater than 1.

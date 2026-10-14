@@ -1,7 +1,7 @@
 import { test, afterEach } from 'bun:test';
 import assert from 'node:assert/strict';
 import { createClient } from '@libsql/client';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPopulationDatabase } from '../lib/db.mjs';
@@ -218,9 +218,9 @@ test('both generators reuse local results and then insert into real SQL tables w
     await populate(task, writable, db, createAI(writable, dependencies), { select: () => 0, log: () => {} });
     assert.equal(calls, generatedCalls);
     assert.equal(await count(client, 'phonetic_transcriptions'), words.length);
-    assert.equal(await count(client, 'pronunciation_respellings'), task === 'respellings' ? words.length : 0);
+    assert.equal(await count(client, 'pronunciation_respellings'), task === 'respellings' ? words.length * 2 : 0);
     assert.deepEqual(batchSizes.ipa, [100, 3]);
-    assert.deepEqual(batchSizes.respell, task === 'respellings' ? [100, 3] : []);
+    assert.deepEqual(batchSizes.respell, task === 'respellings' ? [100, 3, 100, 3] : []);
     assert.deepEqual(snapshot(), before);
     await populate(task, writable, db, createAI(writable, dependencies), { select: () => 0, log: () => {} });
     assert.equal(calls, generatedCalls);
@@ -248,8 +248,10 @@ test('combined SQL population links corrected IPA and existing variants to their
   const ai = createAI(cfg, { log: () => {}, fetchFn: async (url, options) => {
     const input = JSON.parse(JSON.parse(options.body).input[1].content);
     requests.push(input);
-    assert.equal(await count(client, 'phonetic_transcriptions'), 3, 'No new IPA before review');
-    assert.equal(await count(client, 'pronunciation_respellings'), 1, 'No new guides before review');
+    if (requests.length <= 2) {
+      assert.equal(await count(client, 'phonetic_transcriptions'), 3, 'No new IPA before review');
+      assert.equal(await count(client, 'pronunciation_respellings'), 1, 'No new guides before review');
+    }
     return Response.json({ status: 'completed', usage: { input_tokens: 100, output_tokens: 100 },
       output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ records: input.words.map((j) => {
         if (requests.length === 1 && j.transcription === null) return {
@@ -262,12 +264,13 @@ test('combined SQL population links corrected IPA and existing variants to their
       }) }) }] }] });
   } });
   await populate('respellings', cfg, db, ai, { select: () => 0, log: () => {} });
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2].target.code, 'fr');
   assert.deepEqual(requests[0].words.map((j) => j.transcription), [null, '/rɛd/', '/riːd/']);
   assert.equal(requests[1].words.length, 1);
   const links = (await client.execute(`SELECT e.id, p.transcription, r.respelling
     FROM pronunciation_respellings r JOIN phonetic_transcriptions p ON p.id = r.phonetic_transcription_id
-    JOIN entries e ON e.id = p.entry_id ORDER BY e.id, p.transcription`)).rows;
+    JOIN entries e ON e.id = p.entry_id WHERE r.target_language_id = 'es' ORDER BY e.id, p.transcription`)).rows;
   assert.deepEqual(links.map((r) => [r.id, r.transcription, r.respelling]),
     [['e0', '/rɛd/', 'red'], ['e1', '/riːd/', 'rid'], ['e1', '/rɛd/', 'red'], ['e2', '/muːn/', 'a']]);
   assert.equal(await count(client, 'phonetic_transcriptions'), 4);
@@ -314,13 +317,13 @@ test('incompatible existing IPA is skipped without blocking later SQL windows in
       return combinedResponse(input);
     } });
     await populate('respellings', cfg, db, ai, { select: () => 0, log: (s) => logs.push(s) });
-    assert.deepEqual(requests.flatMap((r) => r.words.map((j) => j.word)), ['b', 'c', 'd']);
+    assert.deepEqual(requests.flatMap((r) => r.words.map((j) => j.word)), ['b', 'c', 'd', 'b', 'c', 'd']);
     assert.ok(logs.some((s) => /skipped "a".*incompatible.*correct the stored IPA/.test(s)));
     assert.equal((await client.execute("SELECT transcription FROM phonetic_transcriptions WHERE id = 'legacy'")).rows[0].transcription, '[a]');
     assert.equal(await count(client, 'phonetic_transcriptions'), write ? 4 : 2);
-    assert.equal(await count(client, 'pronunciation_respellings'), write ? 3 : 0);
+    assert.equal(await count(client, 'pronunciation_respellings'), write ? 6 : 0);
     if (write) assert.deepEqual(readdirSync(cfg.stateDir), []);
-    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 3);
+    else assert.equal(readdirSync(join(cfg.stateDir, 'results')).length, 6);
   }
 });
 
@@ -335,7 +338,7 @@ test('partial SQL imports reuse the exact finalized local pair without regenerat
     } };
     const options = { select: () => 0, log: () => {} };
     await populate('respellings', cfg, createPopulationDatabase(client), createAI(cfg, dependencies), options);
-    assert.equal(calls, 1);
+    assert.equal(calls, 2);
     const before = cacheSnapshot(cfg);
     const writeCfg = { ...cfg, write: true };
     const db = createPopulationDatabase(client, writeCfg);
@@ -350,8 +353,8 @@ test('partial SQL imports reuse the exact finalized local pair without regenerat
     const ai = createAI(writeCfg, cachedOnly);
     await populate('respellings', writeCfg, db, ai, options);
     assert.equal(ai.totals().committed, 0);
-    assert.equal(calls, 1);
-    assert.equal(await count(client, 'pronunciation_respellings'), 1);
+    assert.equal(calls, 2);
+    assert.equal(await count(client, 'pronunciation_respellings'), 2);
     assert.deepEqual(cacheSnapshot(cfg), before);
     assert.deepEqual((await client.execute('PRAGMA foreign_key_check')).rows, []);
   }
@@ -360,7 +363,8 @@ test('partial SQL imports reuse the exact finalized local pair without regenerat
 test('the missing-IPA cache is not reused for a different stored pronunciation or generation policy', async () => {
   for (const change of ['pronunciation', 'dialect', 'target', 'model']) {
     const { client, db } = await fixture({ words: ['a'] });
-    const cfg = generationConfig();
+    // Stop after one pair so the other target has no local result yet.
+    const cfg = generationConfig({ budget: 1 });
     let calls = 0;
     const requests = [];
     const dependencies = { log: () => {}, fetchFn: async (url, options) => {
@@ -372,24 +376,24 @@ test('the missing-IPA cache is not reused for a different stored pronunciation o
     const options = { select: () => 0, log: () => {} };
     await populate('respellings', cfg, createPopulationDatabase(client), createAI(cfg, dependencies), options);
     await db.insertTranscriptions([ipaRow('e0', 'a', change === 'pronunciation' ? '/b/' : '/a/')]);
-    const writeCfg = { ...cfg, write: true,
+    const writeCfg = { ...cfg, write: true, budget: 1e9,
       ...(change === 'dialect' ? { languagePolicies: { en: { dialect: 'British English' } } } : {}),
       ...(change === 'model' ? { model: 'another-model' } : {}),
     };
-    if (change === 'target') {
-      // Change the selected pair while keeping the finalized cache files intact.
-      writeFileSync(join(cfg.stateDir, 'respelling-pair.json'), JSON.stringify({ source: 'en', target: 'fr' }));
-    }
     const before = cacheSnapshot(cfg);
     const writableDb = createPopulationDatabase(client, writeCfg);
-    await populate('respellings', writeCfg, writableDb, createAI(writeCfg, dependencies), options);
-    assert.equal(calls, 2, `${change} must prevent fallback reuse`);
+    let selections = 0;
+    await populate('respellings', writeCfg, writableDb, createAI(writeCfg, dependencies), {
+      ...options, select: () => change === 'target' && selections++ === 1 ? 1 : 0,
+    });
+    assert.equal(calls, change === 'target' ? 2 : 3, `${change} must prevent fallback reuse`);
     assert.equal(requests[1].words[0].transcription, change === 'pronunciation' ? '/b/' : '/a/');
     assert.equal(Object.hasOwn(requests[1].words[0], 'cacheFallback'), false);
     assert.deepEqual(cacheSnapshot(cfg), before);
     const saved = (await client.execute(`SELECT p.transcription, r.respelling, r.target_language_id
-      FROM pronunciation_respellings r JOIN phonetic_transcriptions p ON p.id = r.phonetic_transcription_id`)).rows;
+      FROM pronunciation_respellings r JOIN phonetic_transcriptions p ON p.id = r.phonetic_transcription_id
+      ORDER BY r.target_language_id`)).rows;
     assert.deepEqual(saved.map((r) => [r.transcription, r.respelling, r.target_language_id]),
-      [[change === 'pronunciation' ? '/b/' : '/a/', change === 'pronunciation' ? 'b' : 'a', change === 'target' ? 'fr' : 'es']]);
+      ['es', 'fr'].map((target) => [change === 'pronunciation' ? '/b/' : '/a/', change === 'pronunciation' ? 'b' : 'a', target]));
   }
 });

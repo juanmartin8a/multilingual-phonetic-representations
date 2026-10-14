@@ -91,20 +91,23 @@ There are two generators, written for Bun and using OpenAI through Cloudflare
 AI Gateway:
 
 - [`populate-transcriptions.mjs`](scripts/generators/populate-transcriptions.mjs)
-  adds IPA pronunciations to words that do not have one yet. It works across
-  all languages with entries and follows language-specific settings for dialect
-  choices.
+  adds IPA pronunciations to words that do not have one yet. It randomly
+  chooses a language with entries and follows its dialect settings.
 - [`populate-respellings.mjs`](scripts/generators/populate-respellings.mjs)
   adds pronunciation guides for speakers of another language, using that
   language's native writing system. It covers each IPA variant missing a guide
   for the chosen target language. Each generation record contains IPA and its
   respelling together: existing IPA is preserved exactly; missing IPA is
   generated first within the same response, then used to derive the guide. It
-  reuses a saved source/target language pair when available; otherwise, it randomly
-  chooses a source language with entries and a different target language.
-  Local runs save that choice for later runs.
+  randomly chooses a source language with entries and a different target
+  language.
 
-Both scripts work through missing data in batches. Generated results are
+Both scripts work through missing data in batches. After finishing a language
+or source/target pair, they randomly choose another one that has not been
+scanned in this run. Empty selections are skipped. Each language or pair is
+scanned at most once per run, including in local mode where the database is
+unchanged. Runs stop when all eligible selections have been scanned or the
+spending threshold is reached. Generated results are
 checked against the input words and the allowed pronunciation characters.
 Items flagged for review receive a separate automated editing pass before
 being finalized. Respelling records use `transcription` and `respelling` fields,
