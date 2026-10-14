@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { configuration } from '../lib/config.mjs';
 import { usd } from '../../utils/numbers.mjs';
 import { readJson } from '../../utils/files.mjs';
-import { validIpa, validRespelling, validateRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA, RESPELL_REVIEW_OUTPUT_SCHEMA, validateRespellingRecord } from '../lib/data.mjs';
+import { validIpa, validRespelling, validateIpaRecord, choosePair, languagePolicy, validateOrderedRecords, REVIEW_OUTPUT_SCHEMA, RESPELL_REVIEW_OUTPUT_SCHEMA, validateRespellingRecord } from '../lib/data.mjs';
 import { createAI } from '../lib/ai.mjs';
 import { BudgetReachedError, usageCost, reservation, outputText, retryDelay } from '../../utils/ai-gateway.mjs';
 import { populate } from '../lib/run.mjs';
@@ -326,11 +326,10 @@ test('exact integer costs include cache writes and do not double count reasoning
 });
 
 test('record validation rejects invalid review states, IPA, and target scripts', () => {
-  assert.throws(() => validateRecord({ ...row('1'), status: 'review', value: '/a/', note: 'uncertain' }, 'ipa'));
-  assert.throws(() => validateRecord({ ...row('1'), note: 'extra explanation' }, 'ipa'));
-  assert.throws(() => validateRecord({ ...row('1'), status: 'unknown' }, 'ipa'));
-  assert.throws(() => validateRecord(row('1', 'not IPA'), 'ipa'));
-  assert.throws(() => validateRecord(row('1', 'こんにちは'), 'respell', target));
+  assert.throws(() => validateIpaRecord({ ...row('1'), status: 'review', value: '/a/', note: 'uncertain' }));
+  assert.throws(() => validateIpaRecord({ ...row('1'), note: 'extra explanation' }));
+  assert.throws(() => validateIpaRecord({ ...row('1'), status: 'unknown' }));
+  assert.throws(() => validateIpaRecord(row('1', 'not IPA')));
   assert.ok(validIpa('/həˈloʊ/'));
   assert.ok(validIpa('/ni˧˥/'));
   assert.equal(validIpa('/你好/'), false);

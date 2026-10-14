@@ -4,10 +4,10 @@ import { atomicJson, digest, readJson } from '../../utils/files.mjs';
 import { createGateway, MAX_INPUT_RESERVATION, reservedInput, outputText,
   requestBody as gatewayRequestBody } from '../../utils/ai-gateway.mjs';
 import { OUTPUT_SCHEMA, REVIEW_OUTPUT_SCHEMA, RESPELL_OUTPUT_SCHEMA, RESPELL_REVIEW_OUTPUT_SCHEMA,
-  validateRecord, validateRespellingRecord, validateOrderedRecords, needsRespellingReview, validIpa } from './data.mjs';
+  validateIpaRecord, validateRespellingRecord, validateOrderedRecords, needsRespellingReview, validIpa } from './data.mjs';
 import { ipaCharacterPrompt, respellingCharacterPrompt } from './characters.mjs';
 
-function requestBody(cfg, prompt, input, schema = OUTPUT_SCHEMA) {
+function requestBody(cfg, prompt, input, schema) {
   const words = input.words.map((job, index) => ({ index, word: job.word,
     ...(job.transcription !== undefined ? { transcription: job.transcription } : {}),
     ...(job.note !== undefined ? { note: job.note } : {}),
@@ -23,7 +23,7 @@ export function createAI(cfg, dependencies = {}) {
   const reviewPrompts = Object.fromEntries(['ipa', 'respell'].map((task) =>
     [task, readFileSync(new URL(`../prompts/${task}-review.md`, import.meta.url), 'utf8')]));
 
-  function nextBatch(items, offset, prompt, input, schema = OUTPUT_SCHEMA) {
+  function nextBatch(items, offset, prompt, input, schema) {
     let size = Math.min(cfg.batchSize, items.length - offset);
     while (true) {
       const batch = items.slice(offset, offset + size);
@@ -82,7 +82,7 @@ export function createAI(cfg, dependencies = {}) {
           respelling: saved.respelling, respellingStatus: 'ready', note: '' } :
           { key: job.key, status: 'ready', value: saved.value, note: '' };
         if (combined) validateRespellingRecord(record, job, target);
-        else validateRecord(record, task, target);
+        else validateIpaRecord(record);
         cached.push(record);
         if (cached.length === cfg.batchSize) await emit(cached.splice(0));
       } else missing.push(job);

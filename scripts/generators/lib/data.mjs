@@ -177,11 +177,11 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
         if (reviewInvalidValues && ['ready', 'review'].includes(record.status) &&
             typeof record.note === 'string' && record.note.length <= 500 &&
             !(record.status === 'review' && record.value === null) &&
-            !(task === 'ipa' ? validIpa(record.value) : validRespelling(record.value, target))) {
+            !validIpa(record.value)) {
           record = { key: job.key, status: 'review', value: null,
-            note: invalidValueNote(record, task, task === 'ipa' ? source : target) };
+            note: invalidValueNote(record, 'ipa', source) };
         }
-        try { validateRecord(record, task, target); }
+        try { validateIpaRecord(record); }
         catch (error) { reason = error.message; }
       }
     }
@@ -230,15 +230,13 @@ function invalidValueNote(record, task, policy) {
   return `${reason} Returned value: ${JSON.stringify(value)}.${record.note ? ` Earlier note: ${record.note}` : ''}`.slice(0, 500);
 }
 
-export function validateRecord(row, task, target) {
+export function validateIpaRecord(row) {
   if (typeof row.note !== 'string' || row.note.length > 500) throw new Error('Invalid review note');
   if (row.status === 'review') {
     if (row.value !== null || !row.note.trim()) throw new Error('Review records require null and a note');
   } else if (row.status !== 'ready') throw new Error(`Invalid status: ${JSON.stringify(row.status)}`);
   else if (row.note !== '') throw new Error('Ready records require an empty note');
-  else if (!(task === 'ipa' ? validIpa(row.value) : validRespelling(row.value, target))) {
-    throw new Error(`Invalid ${task} value`);
-  }
+  else if (!validIpa(row.value)) throw new Error('Invalid ipa value');
 }
 
 export const pronunciationKey = (entryId, ipa) => digest([entryId, ipa]);
