@@ -20,12 +20,24 @@ const ipaSegments = new Set([...IPA_CHARACTERS.consonants + IPA_CHARACTERS.vowel
 export const isIpaCharacter = (c) => [...c.normalize('NFD')].every((part) => ipaSet.has(part));
 export const hasIpaSegment = (body) => [...body.normalize('NFD')].some((c) => ipaSegments.has(c));
 
+export function validIpaTies(body) {
+  const characters = [...body.normalize('NFD')];
+  let preceding;
+  for (const [index, c] of characters.entries()) {
+    if (c === '\u035c' || c === '\u0361') {
+      if (!ipaSegments.has(preceding) || !ipaSegments.has(characters[index + 1])) return false;
+    } else if (!/\p{M}/u.test(c)) preceding = c;
+  }
+  return true;
+}
+
 export function ipaCharacterPrompt() {
   return `## Allowed IPA characters\nInventory: ${JSON.stringify(IPA_CHARACTERS)}\n` +
     'Combining entries are Unicode code points attached to segments; canonically equivalent precomposed characters are allowed. ' +
     'Use only this inventory inside one pair of /slashes/. Include at least one consonant or vowel. ' +
     'Do not use romanization, hyphens, digits, brackets, or unrelated letters. ' +
     'Affricates use separate segments and optional tie bars, not superseded ligatures. ' +
+    'Tie bars must join two consonant or vowel segments without intervening spaces or stress marks. ' +
     'Tone diacritics mark tone, not vowel length; use ː for length. In Arabic use x or χ as appropriate, never romanization ḫ, and aː for a long a, never romanization ā. ' +
     'Use only symbols appropriate to the source language and dialect; this inventory does not imply that every symbol is suitable for every language.\n';
 }
@@ -43,6 +55,8 @@ const ALPHABETS = {
   ar: ['Arabic', 'ًٌٍَُِّْٰءأؤإئاآبةتثجحخدذرزسشصضطظعغفقكلمنهوىي'],
 };
 const PUNCTUATION = " '-’‐‑";
+const phoneticModifiers = new Set([...IPA_CHARACTERS.modifiers + IPA_CHARACTERS.additional]
+  .filter((c) => !/\p{M}/u.test(c)));
 const respellingPolicies = new Map();
 
 function rangesFor(characters) {
@@ -74,7 +88,8 @@ export function respellingCharacters(policy) {
     for (let point = 0; point <= 0x10ffff; point++) {
       const c = String.fromCodePoint(point);
       if (/[\p{L}\p{M}]/u.test(c) && script.test(c) &&
-          !/[\u0250-\u02af\u1d00-\u1dbf\p{Default_Ignorable_Code_Point}]/u.test(c)) add(c);
+          !/[\u0250-\u02af\u1d00-\u1dbf\p{Default_Ignorable_Code_Point}]/u.test(c) &&
+          !phoneticModifiers.has(c)) add(c);
     }
   }
   const ranges = rangesFor(characters);

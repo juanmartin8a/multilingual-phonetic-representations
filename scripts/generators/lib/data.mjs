@@ -1,5 +1,5 @@
 import { digest } from '../../utils/files.mjs';
-import { isIpaCharacter, hasIpaSegment, respellingCharacters } from './characters.mjs';
+import { isIpaCharacter, hasIpaSegment, validIpaTies, respellingCharacters } from './characters.mjs';
 
 const DIALECTS = {
   en: 'General American English', es: 'neutral Latin American Spanish',
@@ -194,7 +194,7 @@ export function validateOrderedRecords(output, jobs, task, target, { reviewInval
 export function validIpa(value) {
   if (typeof value !== 'string' || value.length > 512 || !/^\/[^/\r\n]+\/$/u.test(value)) return false;
   const body = value.slice(1, -1);
-  return hasIpaSegment(body) && [...body].every(isIpaCharacter) && attachedMarks(body);
+  return hasIpaSegment(body) && [...body].every(isIpaCharacter) && attachedMarks(body) && validIpaTies(body);
 }
 
 export function validRespelling(value, policy) {

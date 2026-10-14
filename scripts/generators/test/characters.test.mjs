@@ -77,6 +77,42 @@ test('native target alphabets, script overrides and canonical marks share one ch
   assert.ok(respellingCharacterPrompt(policy('zh')).length < 6000, 'Han is encoded as ranges, not all characters');
 });
 
+test('IPA tie bars connect two segments, including segments with preceding diacritics', () => {
+  for (const value of ['/t͡ʃ/', '/t͜s/', '/t̠͡ʃ/', '/k͡p/', '/a͡i/']) {
+    assert.ok(validIpa(value), value);
+  }
+  for (const value of ['/t͡/', '/t͜/', '/t͡ a/', '/t͡ˈs/', '/t͡ʰ/', '/ʰ͡t/', '/t͜͡s/']) {
+    assert.equal(validIpa(value), false, value);
+    const result = validateOrderedRecords({ records: [row(value)] }, [job], 'ipa', null,
+      { reviewInvalidValues: true, source });
+    assert.equal(result.rejected.length, 0);
+    assert.equal(result.records[0].status, 'review');
+    assert.equal(result.records[0].value, null);
+    assert.equal(validateOrderedRecords({ records: [row(value)] }, [job], 'ipa', null).rejected.length, 1);
+  }
+});
+
+test('fallback script inventories exclude IPA modifiers and send affected guides for review', () => {
+  for (const code of ['it', 'tr', 'vi', 'sv']) {
+    const p = policy(code);
+    assert.ok(validRespelling('hello', p));
+    const { allowed } = respellingCharacters(p);
+    for (const modifier of 'ʰʷʲˠˤ˞ⁿˡʳʵˀʱʴʶ') {
+      const value = `a${modifier}`;
+      assert.equal(allowed.test(modifier), false, `${code}: ${modifier}`);
+      assert.equal(validRespelling(value, p), false, `${code}: ${value}`);
+      const inputJob = { ...job, transcription: '/a/' };
+      const result = validateOrderedRecords({ records: [pairedRow(job, '/a/', value)] },
+        [inputJob], 'respell', p, { reviewInvalidValues: true, source });
+      assert.equal(result.rejected.length, 0);
+      assert.equal(result.records[0].transcription, '/a/');
+      assert.equal(result.records[0].respellingStatus, 'review');
+      assert.equal(result.records[0].respelling, null);
+      assert.match(result.records[0].note, /characters not allowed/);
+    }
+  }
+});
+
 test('invalid first-pass values become review with diagnostic notes, including existing review candidates', () => {
   for (const [task, value] of [['ipa', '/al-ʔuḫrā/'], ['respell', 'həloʊ'], ['ipa', 'alʔuxraː'],
     ['respell', ''], ['ipa', null], ['respell', 'a'.repeat(513)]]) {
